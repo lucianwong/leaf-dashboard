@@ -10,6 +10,11 @@ import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
 export const FRAME_WIDTH = 1680;
 export const FRAME_HEIGHT = 1264;
 
+// 页面清单(M4 多页面):客户端据此预取与本地缓存,顺序即翻页顺序。
+// calendar 为真实月历(纯服务端可算),ai/servers/agents 暂为占位页,
+// 数据源接入后逐页替换实现。
+export const PAGES = ["home", "calendar", "ai", "servers", "agents"];
+
 const BLACK = "#000000";
 const WHITE = "#FFFFFF";
 
@@ -208,7 +213,7 @@ function drawHLine(ctx, y, x0, x1, lineWidth) {
 /**
  * 渲染一帧测试 Dashboard。
  * @param {object} opts
- * @param {string} opts.page    页面名(角标显示,M4 之前均为 home)
+ * @param {string} opts.page    页面名(PAGES 之一)
  * @param {number} opts.version 当前版本号(分钟数)
  * @param {string} opts.deviceId 设备 ID(footer 显示)
  * @param {number} [opts.now]   渲染时刻(默认当前时间)
@@ -254,7 +259,34 @@ export function renderFrame({ page, version, deviceId, now = Date.now() }) {
 	);
 	drawHLine(ctx, M + 88, M, FRAME_WIDTH - M, 4);
 
-	// ---- 大时钟 + 日期星期 ----
+	// 按页面分发中段内容;顶栏与底栏各页共用
+	if (page === "calendar") {
+		renderCalendarPage(ctx, d);
+	} else if (page === "home") {
+		renderHomePage(ctx, d);
+	} else {
+		renderPlaceholderPage(ctx, page);
+	}
+
+	// ---- 底栏:设备 ID | 刷新策略 ----
+	drawHLine(ctx, 1176, M, FRAME_WIDTH - M, 4);
+	const footY = 1214;
+	drawText(ctx, `ID: ${deviceId}`, M, footY, fontCss(38));
+	drawText(
+		ctx,
+		t("刷新: PARTIAL · 5 分钟", "REFRESH: PARTIAL / 5 MIN"),
+		FRAME_WIDTH - M,
+		footY,
+		fontCss(38, { cjk: true }),
+		"right",
+	);
+
+	return canvas.encode("png");
+}
+
+// ---- Home 页:大时钟 + 日期 + 三个占位 Widget ----
+function renderHomePage(ctx, d) {
+	const M = 48;
 	const hh = pad2(d.getHours());
 	const mm = pad2(d.getMinutes());
 	drawCenteredText(
@@ -316,19 +348,105 @@ export function renderFrame({ page, version, deviceId, now = Date.now() }) {
 			fontCss(38, { cjk: true }),
 		);
 	});
+}
 
-	// ---- 底栏:设备 ID | 刷新策略 ----
-	drawHLine(ctx, 1176, M, FRAME_WIDTH - M, 4);
-	const footY = 1214;
-	drawText(ctx, `ID: ${deviceId}`, M, footY, fontCss(38));
-	drawText(
+// ---- Calendar 页:当月真实月历,今日反白高亮 ----
+function renderCalendarPage(ctx, d) {
+	const M = 48;
+
+	const year = d.getFullYear();
+	const month = d.getMonth();
+	const today = d.getDate();
+
+	// 月标题:左侧年月,右侧"今"角标
+	const monthText = fonts.hasCJK
+		? `${year}年${month + 1}月`
+		: `${MONTH_EN[month]} ${year}`;
+	drawText(ctx, monthText, M, 200, fontCss(96, { bold: true, cjk: true }));
+
+	// 网格区域:顶栏线下方到底栏线上方
+	const gridTop = 300;
+	const gridBottom = 1130;
+	const cellW = (FRAME_WIDTH - 2 * M) / 7;
+	const cellH = (gridBottom - gridTop) / 7; // 首行星期表头 + 6 行日期
+
+	// 星期表头
+	const weekNames = fonts.hasCJK
+		? ["日", "一", "二", "三", "四", "五", "六"]
+		: WEEK_EN;
+	weekNames.forEach((name, i) => {
+		drawCenteredText(
+			ctx,
+			name,
+			M + cellW * (i + 0.5),
+			gridTop + cellH * 0.5,
+			fontCss(52, { bold: true, cjk: true }),
+		);
+	});
+	drawHLine(ctx, gridTop + cellH, M, FRAME_WIDTH - M, 4);
+
+	// 日期格子:当月 1 号的星期偏移决定首行起点
+	const firstDay = new Date(year, month, 1).getDay();
+	const daysInMonth = new Date(year, month + 1, 0).getDate();
+	for (let day = 1; day <= daysInMonth; day++) {
+		const slot = firstDay + day - 1;
+		const col = slot % 7;
+		const row = Math.floor(slot / 7);
+		if (row >= 6) break; // 网格只留 6 行,理论上月份最多占 6 行,防御性截断
+		const cx = M + cellW * (col + 0.5);
+		const cy = gridTop + cellH * (row + 1.5);
+
+		if (day === today) {
+			// 今日:反白块(黑底白字),E-Ink 下最醒目
+			const r = Math.min(cellW, cellH) * 0.42;
+			ctx.fillStyle = BLACK;
+			ctx.beginPath();
+			ctx.arc(cx, cy, r, 0, Math.PI * 2);
+			ctx.fill();
+			ctx.fillStyle = WHITE;
+			drawCenteredText(ctx, String(day), cx, cy, fontCss(56, { bold: true }));
+			ctx.fillStyle = BLACK;
+		} else {
+			drawCenteredText(ctx, String(day), cx, cy, fontCss(56));
+		}
+	}
+
+	// 竖向分隔线(7 列):只画日期区,含首尾共 8 条中的内部 6 条
+	ctx.lineWidth = 2;
+	for (let i = 1; i < 7; i++) {
+		const x = M + cellW * i;
+		ctx.beginPath();
+		ctx.moveTo(x, gridTop + cellH);
+		ctx.lineTo(x, gridBottom);
+		ctx.stroke();
+	}
+}
+
+// ---- 占位页(ai/servers/agents 等):大标题 + 待接入提示 ----
+function renderPlaceholderPage(ctx, page) {
+	const M = 48;
+	drawCenteredText(
 		ctx,
-		t("刷新: PARTIAL · 5 分钟", "REFRESH: PARTIAL / 5 MIN"),
-		FRAME_WIDTH - M,
-		footY,
-		fontCss(38, { cjk: true }),
-		"right",
+		page.toUpperCase(),
+		FRAME_WIDTH / 2,
+		520,
+		fontCss(200, { bold: true }),
 	);
-
-	return canvas.encode("png");
+	drawHLine(ctx, 640, 400, FRAME_WIDTH - 400, 4);
+	drawCenteredText(
+		ctx,
+		t("待接入数据源", "NO DATA SOURCE YET"),
+		FRAME_WIDTH / 2,
+		760,
+		fontCss(64, { cjk: true }),
+	);
+	// 占位页中间区域空旷,补一个页面序号提示便于真机翻页验证
+	const idx = PAGES.indexOf(page) + 1;
+	drawCenteredText(
+		ctx,
+		t(`第 ${idx} / ${PAGES.length} 页`, `PAGE ${idx} / ${PAGES.length}`),
+		FRAME_WIDTH / 2,
+		950,
+		fontCss(44, { cjk: true }),
+	);
 }

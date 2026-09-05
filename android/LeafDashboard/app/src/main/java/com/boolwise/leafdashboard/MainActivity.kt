@@ -35,7 +35,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    回前台自动恢复轮询(Milestone 2 自动更新)
  *  - frame 先落盘 frame_next.png,校验 PNG 魔数后原子 rename 为 frame_current.png;
  *    失败/无网时保留旧画面不动
- *  - 触屏任意处手动刷新;onKeyDown/onKeyUp 全量记录按键(Milestone 0 采集翻页键 KeyCode)
+ *  - 多页面(Milestone 4):页面清单由服务端下发,每页独立 PNG 缓存与版本号;
+ *    触屏左/中/右三区 = 上一页/刷新/下一页,实体键(PAGE_UP/DOWN、DPAD)翻页
+ *  - 版本推进时预取全部页面到本地,翻页离线即时切换
  */
 class MainActivity : Activity() {
     companion object {
@@ -44,7 +46,9 @@ class MainActivity : Activity() {
         private const val KEY_SERVER_URL = "server_url" // 已保存的自定义地址,空串 = 用默认
         private const val KEY_SETUP_DONE = "setup_done"
         private const val KEY_DEVICE_ID = "device_id"
-        private const val KEY_LAST_VERSION = "last_version" // -1 = 从未下载
+        private const val KEY_LAST_VERSION_PREFIX = "last_version_" // 后拼页面名,每页独立版本跟踪
+        private const val KEY_PAGES = "pages" // 服务端下发的页面清单(JSON 数组序列化)
+        private const val KEY_CURRENT_PAGE = "current_page"
         private const val POLL_INTERVAL_MS = 5 * 60 * 1000L
         private const val POLL_RETRY_MS = 30 * 1000L // 上轮失败(无网/超时)后的快速重试间隔
         private const val RESUME_POLL_DELAY_MS = 1 * 1000L // 回前台后延迟一点再刷新,避开焦点切换窗口
@@ -52,6 +56,7 @@ class MainActivity : Activity() {
         private const val READ_TIMEOUT_MS = 30_000 // PNG 约 100KB,内网足够
         private val PNG_MAGIC = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)
         private const val TAG_KEY_LOG = "LeafKeys" // 按键日志 tag:adb logcat -s LeafKeys
+        private const val DEFAULT_PAGE = "home" // 未知的页面名一律回退首页
     }
 
     private lateinit var frameView: ImageView
@@ -65,9 +70,11 @@ class MainActivity : Activity() {
     private val refreshInFlight = AtomicBoolean(false)
     private var currentServerUrl: String = ""
 
+    // 多页面(M4):页面清单由服务端 status 下发,翻页只切本地缓存并按需拉新
+    private var pages: List<String> = listOf(DEFAULT_PAGE)
+    private var currentPage: String = DEFAULT_PAGE
+
     private lateinit var frameDir: File
-    private lateinit var frameNext: File
-    private lateinit var frameCurrent: File
 
     // ------------------------------------------------------------------
     // 生命周期
@@ -82,8 +89,6 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // 信息屏常亮
 
         frameDir = cacheDir
-        frameNext = File(frameDir, "frame_next.png")
-        frameCurrent = File(frameDir, "frame_current.png")
 
         frameView = findViewById(R.id.frame_view)
         setupPanel = findViewById(R.id.setup_panel)
@@ -91,6 +96,9 @@ class MainActivity : Activity() {
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         currentServerUrl = resolveServerUrl(prefs)
+        pages = loadPages(prefs)
+        currentPage = prefs.getString(KEY_CURRENT_PAGE, null)?.takeIf { it in pages }
+            ?: pages.first()
 
         findViewById<Button>(R.id.btn_save).setOnClickListener { onSaveClicked() }
         findViewById<Button>(R.id.btn_skip).setOnClickListener { onSkipClicked() }
@@ -105,7 +113,7 @@ class MainActivity : Activity() {
             urlInput.setText(currentServerUrl)
             setupPanel.visibility = View.VISIBLE
         } else {
-            showCachedFrame()
+            showCachedFrame(currentPage)
             scheduleNextPoll()
         }
     }
@@ -185,7 +193,7 @@ class MainActivity : Activity() {
         currentServerUrl = resolveServerUrl(getSharedPreferences(PREFS, MODE_PRIVATE))
         setupPanel.visibility = View.GONE
         Toast.makeText(this, "服务端:$currentServerUrl", Toast.LENGTH_SHORT).show()
-        showCachedFrame()
+        showCachedFrame(currentPage)
         pollOnce() // 立即拉一次,不等下个轮询周期
     }
 
@@ -241,7 +249,7 @@ class MainActivity : Activity() {
                         Log.w(TAG, "refresh failed: ${result.reason}")
                         // 无网/失败:保持当前画面不动;reason 区分网络断/超时/服务端错
                         val msg =
-                            if (frameCurrent.exists()) {
+                            if (frameFile(currentPage).exists()) {
                                 "刷新失败:${result.reason},保留当前画面"
                             } else {
                                 "刷新失败:${result.reason}"
@@ -269,24 +277,47 @@ class MainActivity : Activity() {
         ) : RefreshResult
     }
 
-    /** 拉取 status,version 有变化才下载 frame */
+    /**
+     * 拉取 status:刷新页面清单,当前页 version 有变化才下载;
+     * 版本推进时顺带把其他页也预取到本地缓存,翻页可离线即时切换
+     */
     private fun checkAndUpdate(): RefreshResult {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         return try {
             val status = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/status")
             val version = status.getInt("version")
-            val page = status.optString("page", "home")
-            val last = prefs.getInt(KEY_LAST_VERSION, -1)
-            if (version == last) {
-                RefreshResult.Unchanged(version)
-            } else {
-                return if (downloadFrame(page, version)) {
-                    prefs.edit().putInt(KEY_LAST_VERSION, version).apply()
-                    RefreshResult.Updated(version)
-                } else {
-                    RefreshResult.Failed("download failed")
+
+            // 页面清单以服务端为准;当前页不在清单里时回退首页
+            status.optJSONArray("pages")?.let { arr ->
+                val list = (0 until arr.length()).mapNotNull { arr.optString(it).takeIf(String::isNotBlank) }
+                if (list.isNotEmpty()) {
+                    pages = list
+                    prefs.edit().putString(KEY_PAGES, list.joinToString(",")).apply()
+                    if (currentPage !in pages) {
+                        currentPage = pages.first()
+                        prefs.edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
+                    }
                 }
             }
+
+            var updated = false
+            // 当前页过期先下,失败不影响其他页预取
+            if (version != lastVersion(prefs, currentPage)) {
+                if (!downloadFrame(currentPage, version)) {
+                    return RefreshResult.Failed("download failed")
+                }
+                setLastVersion(prefs, currentPage, version)
+                updated = true
+            }
+            // 其余页静默预取(仅日志,不参与结果判定)
+            for (page in pages) {
+                if (page == currentPage) continue
+                if (version != lastVersion(prefs, page) && downloadFrame(page, version)) {
+                    setLastVersion(prefs, page, version)
+                    Log.d(TAG, "prefetch page '$page' v$version done")
+                }
+            }
+            if (updated) RefreshResult.Updated(version) else RefreshResult.Unchanged(version)
         } catch (e: Exception) {
             RefreshResult.Failed(describeError(e))
         }
@@ -313,60 +344,104 @@ class MainActivity : Activity() {
             }
         }
 
-    /** 下载 frame:先写 frame_next.png,校验 PNG 魔数后原子替换为 frame_current.png */
+    /** 下载指定页 frame:先写 frame_next_<page>.png,校验 PNG 魔数后原子替换 */
     private fun downloadFrame(
         page: String,
         version: Int,
     ): Boolean {
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val frameTarget = frameFile(page)
+        val frameTemp = File(frameDir, "frame_next_$page.png")
         return try {
             val conn =
-                URL("$currentServerUrl/api/device/${deviceId(prefs)}/frame?page=$page")
+                URL("$currentServerUrl/api/device/${deviceId(getSharedPreferences(PREFS, MODE_PRIVATE))}/frame?page=$page")
                     .openConnection() as HttpURLConnection
             conn.connectTimeout = CONNECT_TIMEOUT_MS
             conn.readTimeout = READ_TIMEOUT_MS
             conn.inputStream.use { input ->
-                frameNext.outputStream().use { output -> input.copyTo(output) }
+                frameTemp.outputStream().use { output -> input.copyTo(output) }
             } // finally 通过 use 保证流关闭
 
-            val bytes = frameNext.readBytes()
+            val bytes = frameTemp.readBytes()
             if (bytes.size <= 8 || !bytes.startsWith(PNG_MAGIC)) {
                 Log.w(TAG, "downloaded frame is not a valid PNG (${bytes.size} bytes), discard")
-                frameNext.delete()
+                frameTemp.delete()
                 return false
             }
 
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             if (bitmap == null) {
                 Log.w(TAG, "PNG decode failed, discard")
-                frameNext.delete()
+                frameTemp.delete()
                 return false
             }
 
             // 同目录 rename 为原子操作:替换完成后才展示,失败不清空当前画面
-            if (!frameNext.renameTo(frameCurrent)) {
-                Log.w(TAG, "rename frame_next -> frame_current failed")
+            if (!frameTemp.renameTo(frameTarget)) {
+                Log.w(TAG, "rename frame_next_$page -> frame_$page failed")
                 return false
             }
-            runOnUiThread { showBitmap(bitmap) }
-            Log.i(TAG, "frame v$version saved (${bytes.size} bytes, ${bitmap.width}x${bitmap.height})")
+            // 只在展示中的页面下载完成后才贴图,后台预取页只落盘不扰动当前画面
+            if (page == currentPage) {
+                runOnUiThread { showBitmap(bitmap) }
+            }
+            Log.i(TAG, "frame '$page' v$version saved (${bytes.size} bytes, ${bitmap.width}x${bitmap.height})")
             true
         } catch (e: Exception) {
-            Log.w(TAG, "download frame failed: ${e.message}")
-            frameNext.delete()
+            Log.w(TAG, "download frame '$page' failed: ${e.message}")
+            frameTemp.delete()
             false
         }
     }
 
-    /** 展示本地缓存的最后一帧;无缓存(首装)则保持黑屏 */
-    private fun showCachedFrame() {
-        if (!frameCurrent.exists()) return
-        val bitmap = BitmapFactory.decodeFile(frameCurrent.absolutePath) ?: return
+    /** 展示指定页的本地缓存;无缓存(首装)则保持黑屏 */
+    private fun showCachedFrame(page: String) {
+        val file = frameFile(page)
+        if (!file.exists()) return
+        val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return
         showBitmap(bitmap)
     }
 
     private fun showBitmap(bitmap: Bitmap) {
         frameView.setImageBitmap(bitmap)
+    }
+
+    /** 每页独立的 frame 缓存文件 */
+    private fun frameFile(page: String): File = File(frameDir, "frame_$page.png")
+
+    private fun lastVersion(
+        prefs: android.content.SharedPreferences,
+        page: String,
+    ): Int = prefs.getInt(KEY_LAST_VERSION_PREFIX + page, -1)
+
+    private fun setLastVersion(
+        prefs: android.content.SharedPreferences,
+        page: String,
+        version: Int,
+    ) {
+        prefs.edit().putInt(KEY_LAST_VERSION_PREFIX + page, version).apply()
+    }
+
+    /** 读取持久化的页面清单,空/损坏时回退单页 home */
+    private fun loadPages(prefs: android.content.SharedPreferences): List<String> {
+        val saved = prefs.getString(KEY_PAGES, null)?.split(",")?.map(String::trim)
+            ?.filter(String::isNotEmpty).orEmpty()
+        return if (saved.isEmpty()) listOf(DEFAULT_PAGE) else saved
+    }
+
+    /**
+     * 翻页:先切本地缓存立即显示,再触发一次刷新按需拉新帧。
+     * 循环翻页;只有一页时退化为刷新。
+     */
+    private fun switchPage(delta: Int) {
+        if (pages.size > 1) {
+            val idx = (pages.indexOf(currentPage) + delta).mod(pages.size)
+            currentPage = pages[idx]
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
+            showCachedFrame(currentPage)
+            Log.i(TAG, "switch to page '$currentPage'")
+        }
+        pollOnce()
     }
 
     /** 设备 ID:首启动生成 UUID 持久化,服务端用它区分多设备 */
@@ -392,21 +467,54 @@ class MainActivity : Activity() {
     // 交互
     // ------------------------------------------------------------------
 
-    /** 触屏任意处:触发一次手动刷新(检查 version → 有变化才下载) */
+    /**
+     * 触屏分三区(大点击区,符合 E-Ink 低频交互原则):
+     * 左 1/3 上一页,右 1/3 下一页,中间 1/3 手动刷新
+     */
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.action == MotionEvent.ACTION_DOWN) {
-            Log.d(TAG, "manual refresh by touch")
-            pollOnce()
+            when {
+                event.x < frameView.width / 3.0 -> {
+                    Log.d(TAG, "page prev by touch")
+                    switchPage(-1)
+                }
+
+                event.x > frameView.width * 2.0 / 3.0 -> {
+                    Log.d(TAG, "page next by touch")
+                    switchPage(+1)
+                }
+
+                else -> {
+                    Log.d(TAG, "manual refresh by touch")
+                    pollOnce()
+                }
+            }
         }
         return super.onTouchEvent(event)
     }
 
-    /** Milestone 0:全量记录实体按键,用于采集 BOOX 翻页键 KeyCode */
+    // 已确认可翻页的键码:标准 PAGE_UP/PAGE_DOWN 与 DPAD 左右(部分 ROM 把翻页键
+    // 映射成这两组;BOOX 实际 KeyCode 真机采集后如有出入再补)
+    private val pageUpKeys = intArrayOf(92, 21) // KEYCODE_PAGE_UP, KEYCODE_DPAD_LEFT
+    private val pageDownKeys = intArrayOf(93, 22) // KEYCODE_PAGE_DOWN, KEYCODE_DPAD_RIGHT
+
+    /** 实体翻页键切页(全部按键仍先在 LeafKeys tag 记录,便于真机采集) */
     override fun onKeyDown(
         keyCode: Int,
         event: KeyEvent?,
     ): Boolean {
         Log.d(TAG_KEY_LOG, "onKeyDown keyCode=$keyCode action=${event?.action} repeatCount=${event?.repeatCount}")
+        when (keyCode) {
+            in pageUpKeys -> {
+                switchPage(-1)
+                return true
+            }
+
+            in pageDownKeys -> {
+                switchPage(+1)
+                return true
+            }
+        }
         return super.onKeyDown(keyCode, event)
     }
 

@@ -17,6 +17,7 @@ import {
 	renderFrame,
 	FRAME_WIDTH,
 	FRAME_HEIGHT,
+	PAGES,
 } from "./renderer.js";
 
 const DEFAULT_PAGE = "home";
@@ -65,11 +66,11 @@ function cacheSet(key, value) {
 	}
 }
 
-// 统一解析 ?page=:仅接受单个字符串值,多值(?page=a&page=b)/非字符串/空串
-// 一律回退 home,status 与 frame 两个端点行为保持一致
+// 统一解析 ?page=:仅接受 PAGES 内的单个字符串值;多值/非字符串/空串/
+// 未知页面名一律回退 home,status 与 frame 两个端点行为保持一致
 function getPageParam(query) {
 	const page = query.page;
-	return typeof page === "string" && page ? page : DEFAULT_PAGE;
+	return PAGES.includes(page) ? page : DEFAULT_PAGE;
 }
 
 // 请求日志:一行一条(时间 IP 方法 路径 状态 耗时)。必须挂在所有路由之前,
@@ -97,6 +98,8 @@ app.get("/api/device/:deviceId/status", (req, res) => {
 		// M3 之前固定 partial,full 刷新策略后续再做
 		refresh: "partial",
 		page: getPageParam(req.query),
+		// 页面清单:客户端据此预取各页 frame 并本地缓存(顺序即翻页顺序)
+		pages: PAGES,
 	});
 });
 
