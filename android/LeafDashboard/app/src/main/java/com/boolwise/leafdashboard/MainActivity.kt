@@ -31,7 +31,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * 职责(Milestone 1):
  *  - Immersive 全屏 + 横屏锁定,单 ImageView 直接贴图,无动画
- *  - 每 5 分钟轮询 status,version 变化才下载 frame(简化版,完整 diff 策略在 M2)
+ *  - 每 5 分钟轮询 status,version 变化才下载 frame;失败 30s 后快速重试,
+ *    回前台自动恢复轮询(Milestone 2 自动更新)
  *  - frame 先落盘 frame_next.png,校验 PNG 魔数后原子 rename 为 frame_current.png;
  *    失败/无网时保留旧画面不动
  *  - 触屏任意处手动刷新;onKeyDown/onKeyUp 全量记录按键(Milestone 0 采集翻页键 KeyCode)
@@ -45,6 +46,8 @@ class MainActivity : Activity() {
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_LAST_VERSION = "last_version" // -1 = 从未下载
         private const val POLL_INTERVAL_MS = 5 * 60 * 1000L
+        private const val POLL_RETRY_MS = 30 * 1000L // 上轮失败(无网/超时)后的快速重试间隔
+        private const val RESUME_POLL_DELAY_MS = 1 * 1000L // 回前台后延迟一点再刷新,避开焦点切换窗口
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 30_000 // PNG 约 100KB,内网足够
         private val PNG_MAGIC = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)
@@ -110,11 +113,19 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         applyImmersive()
+        maybeResumePolling()
     }
 
     override fun onPause() {
         super.onPause()
         // 移除待执行的轮询回调,避免后台无用唤醒
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // 补一刀:onPause 之后仍在途的刷新完成后会重新排轮询回调,
+        // 已入后台时再清一次,避免后台无谓唤醒(M2 网络恢复策略的一部分)
         handler.removeCallbacksAndMessages(null)
     }
 
@@ -182,8 +193,19 @@ class MainActivity : Activity() {
     // 轮询与下载
     // ------------------------------------------------------------------
 
-    private fun scheduleNextPoll() {
-        handler.postDelayed({ pollOnce() }, POLL_INTERVAL_MS)
+    private fun scheduleNextPoll(delayMs: Long = POLL_INTERVAL_MS) {
+        handler.postDelayed({ pollOnce() }, delayMs)
+    }
+
+    /**
+     * 回前台恢复轮询:onPause/onStop 已清空回调,若不补排,回到前台后
+     * 将永远不再自动更新(M2 自动更新的恢复路径)。刷新防抖天然兜住
+     * 在途任务,重复触发安全。
+     */
+    private fun maybeResumePolling() {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        if (!prefs.getBoolean(KEY_SETUP_DONE, false)) return
+        handler.postDelayed({ pollOnce() }, RESUME_POLL_DELAY_MS)
     }
 
     private fun pollOnce() {
@@ -227,7 +249,8 @@ class MainActivity : Activity() {
                         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                     }
                 }
-                scheduleNextPoll()
+                // 失败时 30s 快速重试(网络恢复即自动追上),成功/无变化按正常周期
+                scheduleNextPoll(if (result is RefreshResult.Failed) POLL_RETRY_MS else POLL_INTERVAL_MS)
             }
         }
     }
