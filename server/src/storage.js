@@ -22,9 +22,9 @@ const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 export const DEFAULT_CONFIG = {
 	pollIntervalSec: 300,
 	fullRefreshIntervalSec: 45 * 60,
-	// 天气:Open-Meteo 免费无 key,只需经纬度
-	weatherLat: Number(process.env.WEATHER_LAT ?? 31.23) || 31.23,
-	weatherLon: Number(process.env.WEATHER_LON ?? 121.47) || 121.47,
+	// 天气:Open-Meteo 免费无 key,只需经纬度(默认杭州)
+	weatherLat: Number(process.env.WEATHER_LAT ?? 30.27) || 30.27,
+	weatherLon: Number(process.env.WEATHER_LON ?? 120.16) || 120.16,
 	// 日历:ICS 订阅链接(WebCal/ICS)
 	icsUrl: process.env.CAL_ICS_URL ?? "",
 	// AI 用量:任意返回 JSON 的用量端点,期望 {label, used, quota} 或 {label, text}
