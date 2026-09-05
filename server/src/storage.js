@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isSafePublicHttpUrl } from "./urlguard.js";
 
 const DATA_DIR = path.join(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -15,10 +16,24 @@ const DATA_DIR = path.join(
 const DEVICES_FILE = path.join(DATA_DIR, "devices.json");
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 
-// 默认配置:轮询 5 分钟;45 分钟一次 full 刷新消残影(E-Ink 常规做法)
+// 默认配置:轮询 5 分钟;45 分钟一次 full 刷新消残影(E-Ink 常规做法)。
+// 数据源配置(M6):全部字段可选,未配置的源渲染时回退占位文案;
+// 位置默认上海(仅天气展示用),可被环境变量覆盖(凭据/隐私信息只走 env)。
 export const DEFAULT_CONFIG = {
 	pollIntervalSec: 300,
 	fullRefreshIntervalSec: 45 * 60,
+	// 天气:Open-Meteo 免费无 key,只需经纬度
+	weatherLat: Number(process.env.WEATHER_LAT ?? 31.23) || 31.23,
+	weatherLon: Number(process.env.WEATHER_LON ?? 121.47) || 121.47,
+	// 日历:ICS 订阅链接(WebCal/ICS)
+	icsUrl: process.env.CAL_ICS_URL ?? "",
+	// AI 用量:任意返回 JSON 的用量端点,期望 {label, used, quota} 或 {label, text}
+	aiUsageUrl: process.env.AI_USAGE_URL ?? "",
+	// 服务器/Agent 探活列表:[{name, url}]
+	servers: [],
+	agents: [],
+	// 待办:[{text, done}] 由 Admin 维护
+	todos: [],
 };
 
 /** @type {Map<string, object>} deviceId -> 设备记录 */
@@ -53,6 +68,14 @@ export function initStore() {
 		24 * 3600,
 		DEFAULT_CONFIG.fullRefreshIntervalSec,
 	);
+	// 数据源字段同走 sanitize,保证从文件读入的结构可靠
+	config.weatherLat = Number.isFinite(Number(saved.weatherLat)) ? Number(saved.weatherLat) : DEFAULT_CONFIG.weatherLat;
+	config.weatherLon = Number.isFinite(Number(saved.weatherLon)) ? Number(saved.weatherLon) : DEFAULT_CONFIG.weatherLon;
+	config.icsUrl = typeof saved.icsUrl === "string" ? saved.icsUrl : "";
+	config.aiUsageUrl = typeof saved.aiUsageUrl === "string" ? saved.aiUsageUrl : "";
+	config.servers = sanitizeChecks(saved.servers);
+	config.agents = sanitizeChecks(saved.agents);
+	config.todos = sanitizeTodos(saved.todos);
 }
 
 function clampInt(v, min, max, fallback) {
@@ -102,8 +125,51 @@ export function updateConfig(patch) {
 			config.fullRefreshIntervalSec,
 		);
 	}
+	// 数据源字段:宽松校验,类型不对就忽略该字段
+	if ("weatherLat" in patch) {
+		const n = Number(patch.weatherLat);
+		if (Number.isFinite(n) && n >= -90 && n <= 90) config.weatherLat = n;
+	}
+	if ("weatherLon" in patch) {
+		const n = Number(patch.weatherLon);
+		if (Number.isFinite(n) && n >= -180 && n <= 180) config.weatherLon = n;
+	}
+	for (const key of ["icsUrl", "aiUsageUrl"]) {
+		if (key in patch && typeof patch[key] === "string") {
+			// SSRF 防护:仅接受公网 http(s) URL(Admin 无鉴权,URL 是用户可写输入)
+			const val = patch[key].trim();
+			config[key] = val && isSafePublicHttpUrl(val) ? val : "";
+		}
+	}
+	if ("servers" in patch) config.servers = sanitizeChecks(patch.servers);
+	if ("agents" in patch) config.agents = sanitizeChecks(patch.agents);
+	if ("todos" in patch) config.todos = sanitizeTodos(patch.todos);
 	atomicWrite(CONFIG_FILE, config);
 	return getConfig();
+}
+
+// 探活条目:仅保留 name/url 两个字符串字段,丢弃空行与多余字段
+function sanitizeChecks(raw) {
+	if (!Array.isArray(raw)) return [];
+	return raw
+		.map((it) => ({
+			name: String(it?.name ?? "").slice(0, 40),
+			url: String(it?.url ?? "").trim(),
+		}))
+		.filter((it) => it.name && isSafePublicHttpUrl(it.url))
+		.slice(0, 12);
+}
+
+// 待办条目:text 截断,done 必须是布尔
+function sanitizeTodos(raw) {
+	if (!Array.isArray(raw)) return [];
+	return raw
+		.map((it) => ({
+			text: String(it?.text ?? "").slice(0, 60),
+			done: Boolean(it?.done),
+		}))
+		.filter((it) => it.text)
+		.slice(0, 30);
 }
 
 /** 节流落盘:注册表变更由外部定时 flush,避免每次请求都写盘 */

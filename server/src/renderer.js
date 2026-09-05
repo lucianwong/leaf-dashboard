@@ -6,6 +6,7 @@
 //  - 大字号、大留白、清晰框线分区
 
 import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
+import { getSnapshotData } from "./datasources.js";
 
 export const FRAME_WIDTH = 1680;
 export const FRAME_HEIGHT = 1264;
@@ -211,15 +212,18 @@ function drawHLine(ctx, y, x0, x1, lineWidth) {
 }
 
 /**
- * 渲染一帧测试 Dashboard。
+ * 渲染一帧 Dashboard。
  * @param {object} opts
  * @param {string} opts.page    页面名(PAGES 之一)
  * @param {number} opts.version 当前版本号(分钟数)
  * @param {string} opts.deviceId 设备 ID(footer 显示)
+ * @param {object} [opts.data]  数据源数据(fetchAllData 结果,单项可为 null)
  * @param {number} [opts.now]   渲染时刻(默认当前时间)
  * @returns {Buffer} PNG 数据
  */
-export function renderFrame({ page, version, deviceId, now = Date.now() }) {
+export function renderFrame({ page, version, deviceId, data, now = Date.now() }) {
+	// 数据默认取后台刷新快照(内存读,请求路径零网络);调用方也可显式传入覆盖
+	const frameData = data ?? getSnapshotData();
 	const d = new Date(now);
 
 	const canvas = createCanvas(FRAME_WIDTH, FRAME_HEIGHT);
@@ -261,9 +265,15 @@ export function renderFrame({ page, version, deviceId, now = Date.now() }) {
 
 	// 按页面分发中段内容;顶栏与底栏各页共用
 	if (page === "calendar") {
-		renderCalendarPage(ctx, d);
+		renderCalendarPage(ctx, d, frameData.events);
 	} else if (page === "home") {
-		renderHomePage(ctx, d);
+		renderHomePage(ctx, d, frameData);
+	} else if (page === "servers") {
+		renderStatusPage(ctx, frameData.servers, t("服务器", "SERVERS"));
+	} else if (page === "agents") {
+		renderStatusPage(ctx, frameData.agents, t("智能体", "AGENTS"));
+	} else if (page === "ai") {
+		renderAiPage(ctx, frameData.aiUsage);
 	} else {
 		renderPlaceholderPage(ctx, page);
 	}
@@ -284,8 +294,8 @@ export function renderFrame({ page, version, deviceId, now = Date.now() }) {
 	return canvas.encode("png");
 }
 
-// ---- Home 页:大时钟 + 日期 + 三个占位 Widget ----
-function renderHomePage(ctx, d) {
+// ---- Home 页:大时钟 + 日期 + 天气/日历/待办三框 ----
+function renderHomePage(ctx, d, data) {
 	const M = 48;
 	const hh = pad2(d.getHours());
 	const mm = pad2(d.getMinutes());
@@ -293,8 +303,8 @@ function renderHomePage(ctx, d) {
 		ctx,
 		`${hh}:${mm}`,
 		FRAME_WIDTH / 2,
-		470,
-		fontCss(360, { bold: true }),
+		440,
+		fontCss(320, { bold: true }),
 	);
 
 	const dateText = fonts.hasCJK
@@ -304,69 +314,110 @@ function renderHomePage(ctx, d) {
 		ctx,
 		dateText,
 		FRAME_WIDTH / 2,
-		690,
-		fontCss(76, { cjk: true }),
+		640,
+		fontCss(72, { cjk: true }),
 	);
 
-	// ---- 中部分隔线 + 三个占位 Widget 框 ----
-	drawHLine(ctx, 790, M, FRAME_WIDTH - M, 4);
+	// ---- 中部分隔线 + 天气/日历/待办三框(数据缺失回退占位) ----
+	drawHLine(ctx, 740, M, FRAME_WIDTH - M, 4);
 
-	const boxTop = 830;
+	const boxTop = 780;
 	const boxBottom = 1140;
 	const boxH = boxBottom - boxTop;
 	const gap = 36;
 	const boxW = Math.floor((FRAME_WIDTH - 2 * M - 2 * gap) / 3);
 
 	const widgets = [
-		{ title: t("天气", "WEATHER"), line: t("待接入数据源", "NO DATA YET") },
-		{ title: t("日历", "CALENDAR"), line: t("待接入数据源", "NO DATA YET") },
-		{ title: t("待办", "TODO"), line: t("待接入数据源", "NO DATA YET") },
+		renderWeatherWidget(ctx, M, boxTop, boxW, boxH, data.weather),
+		renderEventsWidget(ctx, M + boxW + gap, boxTop, boxW, boxH, data.events),
+		renderTodoWidget(ctx, M + 2 * (boxW + gap), boxTop, boxW, boxH, data.todos),
 	];
-
-	widgets.forEach((widget, i) => {
-		const x = M + i * (boxW + gap);
-		drawFrameBorder(ctx, x, boxTop, boxW, boxH, 5);
-		drawText(
-			ctx,
-			widget.title,
-			x + 32,
-			boxTop + 56,
-			fontCss(56, { bold: true, cjk: true }),
-		);
-		drawCenteredText(
-			ctx,
-			"—",
-			x + boxW / 2,
-			boxTop + boxH / 2 + 20,
-			fontCss(72, { bold: true }),
-		);
-		drawText(
-			ctx,
-			widget.line,
-			x + 32,
-			boxBottom - 40,
-			fontCss(38, { cjk: true }),
-		);
-	});
+	widgets.forEach((fn) => fn());
 }
 
-// ---- Calendar 页:当月真实月历,今日反白高亮 ----
-function renderCalendarPage(ctx, d) {
+// 三框通用外框+标题,返回内容绘制回调(统一在标题下方起画)
+function renderWeatherWidget(ctx, x, y, w, h, weather) {
+	drawFrameBorder(ctx, x, y, w, h, 5);
+	drawText(ctx, t("天气", "WEATHER"), x + 32, y + 56, fontCss(56, { bold: true, cjk: true }));
+	return () => {
+		const cx = x + w / 2;
+		if (!weather) {
+			drawCenteredText(ctx, t("未配置数据源", "NO SOURCE"), cx, y + h / 2 + 20, fontCss(44, { cjk: true }));
+			return;
+		}
+		drawCenteredText(ctx, `${weather.temp}°`, cx, y + 160, fontCss(120, { bold: true }));
+		drawCenteredText(ctx, weather.cond, cx, y + 275, fontCss(48, { cjk: true }));
+		drawCenteredText(
+			ctx,
+			t(`最高 ${weather.high}° 最低 ${weather.low}°`, `H ${weather.high}° L ${weather.low}°`),
+			cx,
+			y + h - 40,
+			fontCss(40, { cjk: true }),
+		);
+	};
+}
+
+function renderEventsWidget(ctx, x, y, w, h, events) {
+	drawFrameBorder(ctx, x, y, w, h, 5);
+	drawText(ctx, t("日程", "EVENTS"), x + 32, y + 56, fontCss(56, { bold: true, cjk: true }));
+	return () => {
+		if (!events || !events.length) {
+			drawCenteredText(
+				ctx,
+				t("暂无日程", "NO EVENTS"),
+				x + w / 2,
+				y + h / 2 + 20,
+				fontCss(44, { cjk: true }),
+			);
+			return;
+		}
+		// 最多 5 条:时间(月/日 时:分)+ 摘要(截断)
+		events.slice(0, 5).forEach((ev, i) => {
+			const ey = y + 150 + i * 62;
+			const when = `${ev.start.getMonth() + 1}/${ev.start.getDate()} ${pad2(ev.start.getHours())}:${pad2(ev.start.getMinutes())}`;
+			drawText(ctx, when, x + 32, ey, fontCss(36, { bold: true }));
+			drawText(ctx, ev.summary.slice(0, 12), x + 190, ey, fontCss(36, { cjk: true }));
+		});
+	};
+}
+
+function renderTodoWidget(ctx, x, y, w, h, todos) {
+	drawFrameBorder(ctx, x, y, w, h, 5);
+	const open = (todos ?? []).filter((it) => !it.done).length;
+	drawText(ctx, t(`待办 (${open})`, `TODO (${open})`), x + 32, y + 56, fontCss(56, { bold: true, cjk: true }));
+	return () => {
+		if (!todos || !todos.length) {
+			drawCenteredText(ctx, t("暂无待办", "EMPTY"), x + w / 2, y + h / 2 + 20, fontCss(44, { cjk: true }));
+			return;
+		}
+		// 未完成优先,画 5 条;完成项加删除线前缀(√)
+		const shown = [...todos].sort((a, b) => Number(a.done) - Number(b.done)).slice(0, 5);
+		shown.forEach((it, i) => {
+			const ty = y + 150 + i * 62;
+			const mark = it.done ? "√" : "□";
+			const text = it.done ? t(`(已完成) ${it.text}`, `done: ${it.text}`) : it.text.slice(0, 11);
+			drawText(ctx, `${mark} ${text}`, x + 32, ty, fontCss(38, { cjk: true }));
+		});
+	};
+}
+
+// ---- Calendar 页:当月真实月历(今日反白高亮)+ 未来 7 天日程 ----
+function renderCalendarPage(ctx, d, events) {
 	const M = 48;
 
 	const year = d.getFullYear();
 	const month = d.getMonth();
 	const today = d.getDate();
 
-	// 月标题:左侧年月,右侧"今"角标
+	// 月标题:左侧年月
 	const monthText = fonts.hasCJK
 		? `${year}年${month + 1}月`
 		: `${MONTH_EN[month]} ${year}`;
 	drawText(ctx, monthText, M, 200, fontCss(96, { bold: true, cjk: true }));
 
-	// 网格区域:顶栏线下方到底栏线上方
+	// 网格区域:标题下方,底部留 200px 给日程列表
 	const gridTop = 300;
-	const gridBottom = 1130;
+	const gridBottom = 950;
 	const cellW = (FRAME_WIDTH - 2 * M) / 7;
 	const cellH = (gridBottom - gridTop) / 7; // 首行星期表头 + 6 行日期
 
@@ -380,7 +431,7 @@ function renderCalendarPage(ctx, d) {
 			name,
 			M + cellW * (i + 0.5),
 			gridTop + cellH * 0.5,
-			fontCss(52, { bold: true, cjk: true }),
+			fontCss(48, { bold: true, cjk: true }),
 		);
 	});
 	drawHLine(ctx, gridTop + cellH, M, FRAME_WIDTH - M, 4);
@@ -404,14 +455,14 @@ function renderCalendarPage(ctx, d) {
 			ctx.arc(cx, cy, r, 0, Math.PI * 2);
 			ctx.fill();
 			ctx.fillStyle = WHITE;
-			drawCenteredText(ctx, String(day), cx, cy, fontCss(56, { bold: true }));
+			drawCenteredText(ctx, String(day), cx, cy, fontCss(52, { bold: true }));
 			ctx.fillStyle = BLACK;
 		} else {
-			drawCenteredText(ctx, String(day), cx, cy, fontCss(56));
+			drawCenteredText(ctx, String(day), cx, cy, fontCss(52));
 		}
 	}
 
-	// 竖向分隔线(7 列):只画日期区,含首尾共 8 条中的内部 6 条
+	// 竖向分隔线(7 列):只画日期区
 	ctx.lineWidth = 2;
 	for (let i = 1; i < 7; i++) {
 		const x = M + cellW * i;
@@ -420,33 +471,127 @@ function renderCalendarPage(ctx, d) {
 		ctx.lineTo(x, gridBottom);
 		ctx.stroke();
 	}
+
+	// ---- 底部:未来 7 天日程(最多 2 行,一行一条) ----
+	drawHLine(ctx, 990, M, FRAME_WIDTH - M, 4);
+	drawText(ctx, t("近 7 天日程", "NEXT 7 DAYS"), M, 1044, fontCss(44, { bold: true, cjk: true }));
+	if (events?.length) {
+		events.slice(0, 2).forEach((ev, i) => {
+			const ey = 1104 + i * 0; // 单行区域,两条并排显示
+			const when = `${ev.start.getMonth() + 1}/${ev.start.getDate()} ${pad2(ev.start.getHours())}:${pad2(ev.start.getMinutes())}`;
+			const text = `${when}  ${ev.summary.slice(0, 16)}`;
+			drawText(ctx, text, M + 320 + i * ((FRAME_WIDTH - 2 * M - 320) / 2), ey, fontCss(40, { cjk: true }));
+		});
+	} else {
+		drawText(ctx, t("暂无日程", "NO EVENTS"), M + 320, 1104, fontCss(40, { cjk: true }));
+	}
 }
 
-// ---- 占位页(ai/servers/agents 等):大标题 + 待接入提示 ----
-function renderPlaceholderPage(ctx, page) {
+// ---- 服务器/Agent 页:探活列表(在线●+延迟 / 离线○) ----
+function renderStatusPage(ctx, probes, title) {
 	const M = 48;
-	drawCenteredText(
+	drawText(ctx, title, M, 190, fontCss(88, { bold: true, cjk: true }));
+	drawHLine(ctx, 260, M, FRAME_WIDTH - M, 4);
+
+	if (!probes || !probes.length) {
+		drawCenteredText(
+			ctx,
+			t("未配置探活目标,请在 Admin 页添加", "NO TARGETS - ADD IN ADMIN"),
+			FRAME_WIDTH / 2,
+			620,
+			fontCss(48, { cjk: true }),
+		);
+		return;
+	}
+
+	const rowTop = 320;
+	const rowH = 120;
+	probes.slice(0, 6).forEach((p, i) => {
+		const y = rowTop + i * rowH + rowH / 2;
+		// 状态圆点:实心=在线,空心=离线
+		ctx.beginPath();
+		ctx.arc(M + 30, y, 22, 0, Math.PI * 2);
+		if (p.up) {
+			ctx.fill();
+		} else {
+			ctx.lineWidth = 6;
+			ctx.stroke();
+		}
+		drawText(ctx, p.name, M + 90, y, fontCss(52, { bold: true, cjk: true }));
+		const status = p.up ? t(`在线 · ${p.ms}ms`, `UP · ${p.ms}ms`) : t("离线", "DOWN");
+		drawText(
+			ctx,
+			status,
+			FRAME_WIDTH - M,
+			y,
+			fontCss(44, { cjk: true }),
+			"right",
+		);
+		if (i < Math.min(probes.length, 6) - 1) {
+			drawHLine(ctx, rowTop + (i + 1) * rowH, M, FRAME_WIDTH - M, 2);
+		}
+	});
+
+	const upCount = probes.filter((p) => p.up).length;
+	drawText(
 		ctx,
-		page.toUpperCase(),
-		FRAME_WIDTH / 2,
-		520,
-		fontCss(200, { bold: true }),
+		t(`${upCount} / ${probes.length} 在线`, `${upCount} / ${probes.length} UP`),
+		M,
+		1144,
+		fontCss(40, { cjk: true }),
 	);
-	drawHLine(ctx, 640, 400, FRAME_WIDTH - 400, 4);
-	drawCenteredText(
-		ctx,
-		t("待接入数据源", "NO DATA SOURCE YET"),
-		FRAME_WIDTH / 2,
-		760,
-		fontCss(64, { cjk: true }),
-	);
-	// 占位页中间区域空旷,补一个页面序号提示便于真机翻页验证
-	const idx = PAGES.indexOf(page) + 1;
-	drawCenteredText(
-		ctx,
-		t(`第 ${idx} / ${PAGES.length} 页`, `PAGE ${idx} / ${PAGES.length}`),
-		FRAME_WIDTH / 2,
-		950,
-		fontCss(44, { cjk: true }),
-	);
+}
+
+// ---- AI 页:用量(配额进度条,E-Ink 黑白条纹)+ 文本摘要 ----
+function renderAiPage(ctx, usage) {
+	const M = 48;
+	drawText(ctx, t("AI 用量", "AI USAGE"), M, 190, fontCss(88, { bold: true, cjk: true }));
+	drawHLine(ctx, 260, M, FRAME_WIDTH - M, 4);
+
+	if (!usage) {
+		drawCenteredText(
+			ctx,
+			t("未配置用量端点,请在 Admin 页填写", "NO ENDPOINT - CONFIGURE IN ADMIN"),
+			FRAME_WIDTH / 2,
+			620,
+			fontCss(48, { cjk: true }),
+		);
+		return;
+	}
+
+	drawCenteredText(ctx, usage.label, FRAME_WIDTH / 2, 380, fontCss(64, { cjk: true }));
+
+	if (usage.text) {
+		drawCenteredText(ctx, usage.text.slice(0, 24), FRAME_WIDTH / 2, 560, fontCss(88, { bold: true, cjk: true }));
+	} else if (usage.used != null && usage.quota) {
+		// 大数字 + 黑白进度条(条纹填充,E-Ink 友好)
+		drawCenteredText(
+			ctx,
+			`${usage.used} / ${usage.quota}`,
+			FRAME_WIDTH / 2,
+			560,
+			fontCss(120, { bold: true }),
+		);
+		const barX = 240;
+		const barW = FRAME_WIDTH - 2 * 240;
+		const ratio = Math.min(1, usage.used / usage.quota);
+		const barY = 700;
+		const barH = 80;
+		ctx.lineWidth = 6;
+		ctx.strokeRect(barX, barY, barW, barH);
+		// 条纹填充:每 24px 一根竖线,黑底比例按 ratio
+		const fillW = Math.round(barW * ratio);
+		ctx.save();
+		ctx.beginPath();
+		ctx.rect(barX, barY, fillW, barH);
+		ctx.clip();
+		for (let x = barX; x < barX + fillW; x += 24) {
+			ctx.fillRect(x, barY, 12, barH);
+		}
+		ctx.restore();
+		// 百分比角标
+		drawCenteredText(ctx, `${Math.round(ratio * 100)}%`, FRAME_WIDTH / 2, 860, fontCss(64, { bold: true }));
+	} else if (usage.used != null) {
+		drawCenteredText(ctx, String(usage.used), FRAME_WIDTH / 2, 560, fontCss(120, { bold: true }));
+	}
 }

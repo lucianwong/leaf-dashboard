@@ -27,6 +27,8 @@
       }
       button:hover { background: #000; color: #fff; }
       #msg { font-weight: bold; }
+      #msgDs { font-weight: bold; }
+      .hint { font-size: 0.85em; }
       img.preview { border: 3px solid #000; width: 100%; image-rendering: pixelated; }
       select { font: inherit; border: 2px solid #000; padding: 0.2em; }
     </style>
@@ -48,6 +50,17 @@
     <label>全刷间隔(秒,300–86400,消残影周期) <input id="full" type="number" min="300" max="86400" step="300" /></label>
     <button id="save">保存配置</button>
     <span id="msg"></span>
+
+    <h2>数据源(M6)</h2>
+    <p class="hint">天气用 Open-Meteo(无需 key);URL 仅允许公网 http(s),内网/localhost 会被拒绝(防 SSRF)。</p>
+    <label>纬度 <input id="lat" type="number" step="0.01" min="-90" max="90" /> 经度 <input id="lon" type="number" step="0.01" min="-180" max="180" /></label>
+    <label>日历 ICS 订阅 URL <input id="ics" type="url" style="width:26em" placeholder="https://…/calendar.ics" /></label>
+    <label>AI 用量端点(返回 JSON {label, used, quota} 或 {label, text}) <input id="ai" type="url" style="width:22em" placeholder="https://…" /></label>
+    <label>服务器探活(每行一条:名称 | URL)<textarea id="servers" rows="3" style="width:100%;font:inherit;border:2px solid #000" placeholder="NAS | https://nas.example.com/health"></textarea></label>
+    <label>Agent 探活(每行一条:名称 | URL)<textarea id="agents" rows="3" style="width:100%;font:inherit;border:2px solid #000" placeholder="codex | https://agent.example.com/status"></textarea></label>
+    <label>待办(每行一条:"[ ] 待办"未完成,"[x] 待办"已完成,最多 30 条)<textarea id="todos" rows="4" style="width:100%;font:inherit;border:2px solid #000" placeholder="[ ] 交接文档&#10;[x] 买贴膜"></textarea></label>
+    <button id="saveDs">保存数据源</button>
+    <span id="msgDs"></span>
 
     <h2>预览</h2>
     <p>
@@ -88,6 +101,32 @@
         const cfg = await (await fetch("api/admin/config")).json();
         document.getElementById("poll").value = cfg.pollIntervalSec;
         document.getElementById("full").value = cfg.fullRefreshIntervalSec;
+        // 数据源配置
+        document.getElementById("lat").value = cfg.weatherLat;
+        document.getElementById("lon").value = cfg.weatherLon;
+        document.getElementById("ics").value = cfg.icsUrl ?? "";
+        document.getElementById("ai").value = cfg.aiUsageUrl ?? "";
+        document.getElementById("servers").value = (cfg.servers ?? []).map((s) => s.name + " | " + s.url).join("\n");
+        document.getElementById("agents").value = (cfg.agents ?? []).map((s) => s.name + " | " + s.url).join("\n");
+        document.getElementById("todos").value = (cfg.todos ?? [])
+          .map((it) => (it.done ? "[x] " : "[ ] ") + it.text).join("\n");
+      }
+
+      // "名称 | URL" 行 -> [{name,url}]
+      function parseChecks(text) {
+        return text.split("\n").map((l) => l.trim()).filter(Boolean).map((line) => {
+          const sep = line.indexOf("|");
+          if (sep < 0) return { name: line.slice(0, 40), url: "" };
+          return { name: line.slice(0, sep).trim(), url: line.slice(sep + 1).trim() };
+        });
+      }
+
+      // "[ ]/[x] 文本" 行 -> [{text,done}]
+      function parseTodos(text) {
+        return text.split("\n").map((l) => l.trim()).filter(Boolean).map((line) => {
+          const m = line.match(/^\[( |x|X)\]\s*(.+)$/);
+          return m ? { done: m[1].toLowerCase() === "x", text: m[2] } : { done: false, text: line };
+        });
       }
 
       async function saveConfig() {
@@ -103,6 +142,28 @@
         const cfg = await res.json();
         document.getElementById("msg").textContent =
           "已保存:轮询 " + cfg.pollIntervalSec + "s · 全刷 " + cfg.fullRefreshIntervalSec + "s";
+        loadConfig();
+      }
+
+      async function saveDatasources() {
+        const body = {
+          weatherLat: Number(document.getElementById("lat").value),
+          weatherLon: Number(document.getElementById("lon").value),
+          icsUrl: document.getElementById("ics").value.trim(),
+          aiUsageUrl: document.getElementById("ai").value.trim(),
+          servers: parseChecks(document.getElementById("servers").value),
+          agents: parseChecks(document.getElementById("agents").value),
+          todos: parseTodos(document.getElementById("todos").value),
+        };
+        const res = await fetch("api/admin/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const cfg = await res.json();
+        document.getElementById("msgDs").textContent =
+          "已保存:" + (cfg.servers?.length ?? 0) + " 服务器 / " + (cfg.agents?.length ?? 0) +
+          " Agent / " + (cfg.todos?.length ?? 0) + " 待办(内网 URL 已自动过滤)";
         loadConfig();
       }
 
@@ -126,6 +187,7 @@
       }
 
       document.getElementById("save").onclick = saveConfig;
+      document.getElementById("saveDs").onclick = saveDatasources;
       document.getElementById("reload").onclick = reloadPreview;
       loadDevices();
       loadConfig();

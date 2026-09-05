@@ -27,8 +27,10 @@ import {
 	updateConfig,
 	flushDevices,
 } from "./storage.js";
+import { startBackgroundRefresh, getSnapshotData } from "./datasources.js";
 
 initStore();
+startBackgroundRefresh();
 // 设备注册表节流落盘:10s 一次,进程退出时丢失最多 10s 心跳,可接受
 setInterval(flushDevices, 10_000).unref();
 
