@@ -110,7 +110,7 @@ class MainActivity : Activity() {
         // 右下角浮动刷新按钮:与触屏手动刷新行为完全一致(含防抖)
         findViewById<ImageButton>(R.id.btn_refresh).setOnClickListener {
             Log.d(TAG, "manual refresh by button")
-            pollOnce()
+            pollOnce(manual = true)
         }
 
         // 首启动(未做过设置)显示简易设置面板;否则直接进入显示模式
@@ -221,14 +221,21 @@ class MainActivity : Activity() {
         handler.postDelayed({ pollOnce() }, RESUME_POLL_DELAY_MS)
     }
 
-    private fun pollOnce() {
+    /**
+     * 拉取一轮 status/frame。
+     * @param manual 仅手动刷新(触屏中区/刷新按钮)时为 true——只有手动刷新
+     * 才弹 Toast 反馈;自动轮询/翻页触发的拉取完全静默,不遮挡画面
+     */
+    private fun pollOnce(manual: Boolean = false) {
         // 防抖:已有刷新在进行中(下载/请求未返回)时,重复触屏或重复点按钮直接忽略
         if (!refreshInFlight.compareAndSet(false, true)) {
             Log.d(TAG, "refresh already in progress, ignore")
             return
         }
-        // 即时反馈:防抖通过、即将执行刷新,让用户点击有感
-        Toast.makeText(this, "正在刷新…", Toast.LENGTH_SHORT).show()
+        // 即时反馈:仅手动刷新时提示,自动轮询不打扰观看
+        if (manual) {
+            Toast.makeText(this, "正在刷新…", Toast.LENGTH_SHORT).show()
+        }
         // 清除已排队的周期轮询,立即执行本轮
         handler.removeCallbacksAndMessages(null)
         ioExecutor.execute {
@@ -256,14 +263,16 @@ class MainActivity : Activity() {
 
                     is RefreshResult.Failed -> {
                         Log.w(TAG, "refresh failed: ${result.reason}")
-                        // 无网/失败:保持当前画面不动;reason 区分网络断/超时/服务端错
-                        val msg =
-                            if (frameFile(currentPage).exists()) {
-                                "刷新失败:${result.reason},保留当前画面"
-                            } else {
-                                "刷新失败:${result.reason}"
-                            }
-                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        // 无网/失败:保持当前画面不动;仅手动刷新弹提示,自动轮询静默重试
+                        if (manual) {
+                            val msg =
+                                if (frameFile(currentPage).exists()) {
+                                    "刷新失败:${result.reason},保留当前画面"
+                                } else {
+                                    "刷新失败:${result.reason}"
+                                }
+                            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        }
                     }
                 }
                 // 失败时 30s 快速重试(网络恢复即自动追上);成功/无变化按服务端下发周期
@@ -556,7 +565,7 @@ class MainActivity : Activity() {
 
                 else -> {
                     Log.d(TAG, "manual refresh by touch")
-                    pollOnce()
+                    pollOnce(manual = true)
                 }
             }
         }
