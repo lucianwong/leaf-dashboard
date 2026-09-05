@@ -19,6 +19,18 @@ import {
 	FRAME_HEIGHT,
 	PAGES,
 } from "./renderer.js";
+import {
+	initStore,
+	touchDevice,
+	listDevices,
+	getConfig,
+	updateConfig,
+	flushDevices,
+} from "./storage.js";
+
+initStore();
+// 设备注册表节流落盘:10s 一次,进程退出时丢失最多 10s 心跳,可接受
+setInterval(flushDevices, 10_000).unref();
 
 const DEFAULT_PAGE = "home";
 
@@ -91,15 +103,23 @@ app.get("/healthz", (_req, res) => {
 
 app.get("/api/device/:deviceId/status", (req, res) => {
 	const version = currentVersion();
+	const page = getPageParam(req.query);
+	const config = getConfig();
+	touchDevice(req.params.deviceId, { version, page });
 	res.set("Cache-Control", "no-store");
 	res.json({
 		version,
 		updatedAt: formatUpdatedAt(version),
-		// M3 之前固定 partial,full 刷新策略后续再做
-		refresh: "partial",
-		page: getPageParam(req.query),
-		// 页面清单:客户端据此预取各页 frame 并本地缓存(顺序即翻页顺序)
+		// M3:按 fullRefreshIntervalSec 周期性下发 full,其余 partial;
+		// full 用于消残影,客户端尽力触发整屏刷新
+		refresh:
+			version % Math.max(1, Math.round(config.fullRefreshIntervalSec / 60)) === 0
+				? "full"
+				: "partial",
+		page,
 		pages: PAGES,
+		// 轮询间隔由服务端统一控制,客户端钳制后应用
+		pollIntervalSec: config.pollIntervalSec,
 	});
 });
 
@@ -109,6 +129,9 @@ app.get("/api/device/:deviceId/frame", async (req, res, next) => {
 		const page = getPageParam(req.query);
 		const version = currentVersion();
 		const cacheKey = `${deviceId}:${page}`;
+
+		// frame 下载也计入设备心跳(比 status 更能代表"真的在显示")
+		touchDevice(deviceId, { version, page });
 
 		// 缓存命中:同 version 不重复渲染
 		const cached = cacheGet(cacheKey);
@@ -151,6 +174,23 @@ app.get("/download", (_req, res) => {
 			res.status(err.status || 500).json({ error: "apk not found" });
 		}
 	});
+});
+
+// ---- Admin API(Milestone 5)----
+// 内网信任环境,无鉴权(与 /download 一致);页面见 public/admin.html
+
+app.get("/api/admin/devices", (_req, res) => {
+	res.set("Cache-Control", "no-store");
+	res.json({ devices: listDevices() });
+});
+
+app.get("/api/admin/config", (_req, res) => {
+	res.json(getConfig());
+});
+
+app.post("/api/admin/config", express.json(), (req, res) => {
+	// 只取白名单字段,防止任意键写盘
+	res.json(updateConfig(req.body ?? {}));
 });
 
 // 静态分发 public/(index.html 安装引导页;需在 404 兜底之前挂载)

@@ -74,6 +74,11 @@ class MainActivity : Activity() {
     private var pages: List<String> = listOf(DEFAULT_PAGE)
     private var currentPage: String = DEFAULT_PAGE
 
+    // 轮询间隔由服务端 status 下发统一控制(钳制 1~60 分钟),默认 5 分钟
+    private var pollIntervalMs: Long = POLL_INTERVAL_MS
+    // 本轮 status 要求 full 刷新(消残影),有新帧贴图后在 UI 线程触发整刷
+    private var pendingFullRefresh = false
+
     private lateinit var frameDir: File
 
     // ------------------------------------------------------------------
@@ -239,6 +244,10 @@ class MainActivity : Activity() {
                 when (result) {
                     is RefreshResult.Updated -> {
                         Log.i(TAG, "frame updated to version ${result.version}")
+                        if (pendingFullRefresh) {
+                            pendingFullRefresh = false
+                            performEinkFullRefresh()
+                        }
                     }
 
                     is RefreshResult.Unchanged -> {
@@ -257,8 +266,8 @@ class MainActivity : Activity() {
                         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                     }
                 }
-                // 失败时 30s 快速重试(网络恢复即自动追上),成功/无变化按正常周期
-                scheduleNextPoll(if (result is RefreshResult.Failed) POLL_RETRY_MS else POLL_INTERVAL_MS)
+                // 失败时 30s 快速重试(网络恢复即自动追上);成功/无变化按服务端下发周期
+                scheduleNextPoll(if (result is RefreshResult.Failed) POLL_RETRY_MS else pollIntervalMs)
             }
         }
     }
@@ -286,6 +295,10 @@ class MainActivity : Activity() {
         return try {
             val status = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/status")
             val version = status.getInt("version")
+            // 服务端统一控制轮询节奏与刷新策略(M5)
+            pollIntervalMs = status.optLong("pollIntervalSec", POLL_INTERVAL_MS / 1000)
+                .coerceIn(60, 3600) * 1000
+            val forceFull = status.optString("refresh", "partial") == "full"
 
             // 页面清单以服务端为准;当前页不在清单里时回退首页
             status.optJSONArray("pages")?.let { arr ->
@@ -308,8 +321,7 @@ class MainActivity : Activity() {
                 }
                 setLastVersion(prefs, currentPage, version)
                 updated = true
-            }
-            // 其余页静默预取(仅日志,不参与结果判定)
+            }            // 其余页静默预取(仅日志,不参与结果判定)
             for (page in pages) {
                 if (page == currentPage) continue
                 if (version != lastVersion(prefs, page) && downloadFrame(page, version)) {
@@ -317,6 +329,8 @@ class MainActivity : Activity() {
                     Log.d(TAG, "prefetch page '$page' v$version done")
                 }
             }
+            // 有新帧且服务端要求 full 时,贴图后做一次整刷消残影
+            pendingFullRefresh = forceFull && updated
             if (updated) RefreshResult.Updated(version) else RefreshResult.Unchanged(version)
         } catch (e: Exception) {
             RefreshResult.Failed(describeError(e))
@@ -403,6 +417,62 @@ class MainActivity : Activity() {
 
     private fun showBitmap(bitmap: Bitmap) {
         frameView.setImageBitmap(bitmap)
+    }
+
+    /**
+     * E-Ink 整屏刷新(M3,消残影):BOOX 专有 API 无公开文档且随固件变化,
+     * 这里先反射尝试 Onyx 系统接口;全部失败则退回"白→黑→内容"三连贴图,
+     * 利用墨水屏驱动对全黑帧的波形响应模拟整刷。
+     * 真机效果待 Leaf5+ 实测校准,失败只记日志不影响显示链路。
+     */
+    private fun performEinkFullRefresh() {
+        Log.i(TAG, "eink full refresh requested")
+        if (tryOnyxFullRefresh()) return
+
+        // 兜底:三连贴图模拟整刷。全黑帧会让墨水屏驱动做一次全波形刷新,
+        // 是无 SDK 时的通行做法。临时 Bitmap 用完即回收,间隔期间不响应布局变化。
+        val w = frameView.width
+        val h = frameView.height
+        if (w <= 0 || h <= 0) return
+        val solid: (Int) -> Bitmap = { color ->
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { it.eraseColor(color) }
+        }
+        frameView.setImageBitmap(solid(android.graphics.Color.WHITE))
+        frameView.postDelayed({
+            frameView.setImageBitmap(solid(android.graphics.Color.BLACK))
+            frameView.postDelayed({
+                showCachedFrame(currentPage)
+            }, 150)
+        }, 150)
+    }
+
+    /** 反射尝试 Onyx/BOOX 墨水屏整刷接口:任一命中即返回 true */
+    private fun tryOnyxFullRefresh(): Boolean {
+        val candidates = listOf(
+            // Onyx SDK 常见入口:EpdController.refreshScreen / fullRefresh
+            "com.onyx.android.sdk.device.EpdController",
+            "com.onyx.android.sdk.api.device.epd.EpdController",
+        )
+        for (name in candidates) {
+            try {
+                val cls = Class.forName(name)
+                for (method in cls.declaredMethods) {
+                    val n = method.name.lowercase()
+                    if (n == "fullrefresh" || n == "refreshscreen" || n == "fullrefreshwithhistogram") {
+                        // 参数签名各固件不一,能无参调用就调,否则跳过
+                        method.isAccessible = true
+                        if (method.parameterTypes.isEmpty()) {
+                            method.invoke(null)
+                            Log.i(TAG, "eink full refresh via $name.${method.name}")
+                            return true
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.d(TAG, "eink api $name unavailable: ${e.javaClass.simpleName}")
+            }
+        }
+        return false
     }
 
     /** 每页独立的 frame 缓存文件 */

@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Leaf5+ Dashboard Admin</title>
+    <style>
+      /* E-Ink 风格:纯黑白、高对比、无渐变无动画 */
+      body {
+        background: #fff;
+        color: #000;
+        font-family: -apple-system, "PingFang SC", Arial, sans-serif;
+        max-width: 52em;
+        margin: 3em auto;
+        padding: 0 1.5em;
+      }
+      h1 { font-size: 1.6em; border-bottom: 4px solid #000; padding-bottom: 0.5em; }
+      h2 { font-size: 1.15em; margin-top: 2em; }
+      table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
+      th, td { border: 2px solid #000; padding: 0.5em 0.8em; text-align: left; }
+      th { background: #000; color: #fff; }
+      label { display: block; margin: 0.8em 0; }
+      input { font: inherit; padding: 0.3em; border: 2px solid #000; width: 8em; }
+      button {
+        font: inherit; font-weight: bold; border: 3px solid #000;
+        background: #fff; color: #000; padding: 0.6em 1.5em; cursor: pointer;
+      }
+      button:hover { background: #000; color: #fff; }
+      #msg { font-weight: bold; }
+      img.preview { border: 3px solid #000; width: 100%; image-rendering: pixelated; }
+      select { font: inherit; border: 2px solid #000; padding: 0.2em; }
+    </style>
+  </head>
+  <body>
+    <h1>Leaf5+ Dashboard Admin</h1>
+    <p><a href="/">安装引导页</a> · 仅供可信内网访问,无鉴权,勿暴露公网</p>
+
+    <h2>设备</h2>
+    <table id="devices">
+      <thead>
+        <tr><th>Device ID</th><th>最后在线</th><th>版本</th><th>页面</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <h2>刷新配置</h2>
+    <label>轮询间隔(秒,60–3600) <input id="poll" type="number" min="60" max="3600" step="30" /></label>
+    <label>全刷间隔(秒,300–86400,消残影周期) <input id="full" type="number" min="300" max="86400" step="300" /></label>
+    <button id="save">保存配置</button>
+    <span id="msg"></span>
+
+    <h2>预览</h2>
+    <p>
+      页面:
+      <select id="pageSel"></select>
+      <button id="reload">刷新预览</button>
+    </p>
+    <img class="preview" id="preview" alt="frame preview" />
+
+    <script>
+      // 时间戳转本地可读:同分钟内显示"刚刚"
+      function fmt(ts) {
+        if (!ts) return "-";
+        const s = Math.round((Date.now() - ts) / 1000);
+        if (s < 60) return "刚刚";
+        if (s < 3600) return Math.floor(s / 60) + " 分钟前";
+        if (s < 86400) return Math.floor(s / 3600) + " 小时前";
+        return Math.floor(s / 86400) + " 天前";
+      }
+
+      async function loadDevices() {
+        const res = await fetch("api/admin/devices");
+        const data = await res.json();
+        const tbody = document.querySelector("#devices tbody");
+        tbody.innerHTML = "";
+        for (const d of data.devices) {
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            "<td>" + d.deviceId.slice(0, 8) + "…</td>" +
+            "<td>" + fmt(d.lastSeen) + "</td>" +
+            "<td>v" + (d.lastVersion ?? "-") + "</td>" +
+            "<td>" + (d.page ?? "-") + "</td>";
+          tbody.appendChild(tr);
+        }
+      }
+
+      async function loadConfig() {
+        const cfg = await (await fetch("api/admin/config")).json();
+        document.getElementById("poll").value = cfg.pollIntervalSec;
+        document.getElementById("full").value = cfg.fullRefreshIntervalSec;
+      }
+
+      async function saveConfig() {
+        const body = {
+          pollIntervalSec: Number(document.getElementById("poll").value),
+          fullRefreshIntervalSec: Number(document.getElementById("full").value),
+        };
+        const res = await fetch("api/admin/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const cfg = await res.json();
+        document.getElementById("msg").textContent =
+          "已保存:轮询 " + cfg.pollIntervalSec + "s · 全刷 " + cfg.fullRefreshIntervalSec + "s";
+        loadConfig();
+      }
+
+      // 预览:直接引用 frame 接口,带时间戳避免缓存
+      function reloadPreview() {
+        const page = document.getElementById("pageSel").value;
+        const img = document.getElementById("preview");
+        img.src = "api/device/admin-preview/frame?page=" + page + "&t=" + Date.now();
+      }
+
+      async function initPages() {
+        const status = await (await fetch("api/device/admin-preview/status")).json();
+        const sel = document.getElementById("pageSel");
+        for (const p of status.pages) {
+          const opt = document.createElement("option");
+          opt.value = p; opt.textContent = p;
+          sel.appendChild(opt);
+        }
+        sel.onchange = reloadPreview;
+        reloadPreview();
+      }
+
+      document.getElementById("save").onclick = saveConfig;
+      document.getElementById("reload").onclick = reloadPreview;
+      loadDevices();
+      loadConfig();
+      initPages();
+      setInterval(loadDevices, 30_000); // 设备在线状态 30s 自刷新
+    </script>
+  </body>
+</html>
