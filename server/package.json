@@ -1,0 +1,18 @@
+{
+  "name": "leaf5-dashboard-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BOOX Leaf5+ E-Ink Dashboard 服务端:渲染 1680x1264 黑白 PNG Frame",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.80",
+    "express": "^4.21.2"
+  }
+}
