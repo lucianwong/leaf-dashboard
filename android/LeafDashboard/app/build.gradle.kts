@@ -13,7 +13,7 @@ android {
         minSdk = 28
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "0.1.2"
 
         // 默认 Dashboard 服务端地址(可被首启动设置里保存的 URL 覆盖)。
         // 换部署环境时改这里,或在 App 首启动界面输入新地址。

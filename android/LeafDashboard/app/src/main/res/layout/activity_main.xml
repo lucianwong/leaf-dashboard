@@ -57,4 +57,16 @@
             android:text="@string/setup_skip"
             android:textSize="20sp" />
     </LinearLayout>
+
+    <!-- 右下角浮动刷新按钮:64dp 触摸区,白半透明圆底 + 黑描边,不紧贴边缘 -->
+    <ImageButton
+        android:id="@+id/btn_refresh"
+        android:layout_width="64dp"
+        android:layout_height="64dp"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="24dp"
+        android:background="@drawable/bg_refresh_button"
+        android:contentDescription="@string/refresh_cd"
+        android:scaleType="center"
+        android:src="@android:drawable/ic_menu_rotate" />
 </FrameLayout>

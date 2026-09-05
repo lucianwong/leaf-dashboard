@@ -9,6 +9,8 @@
 // 与大时钟 HH:MM 内容变化节奏一致,每分钟自然 +1。
 
 import express from "express";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import {
 	currentVersion,
 	formatUpdatedAt,
@@ -70,6 +72,18 @@ function getPageParam(query) {
 	return typeof page === "string" && page ? page : DEFAULT_PAGE;
 }
 
+// 请求日志:一行一条(时间 IP 方法 路径 状态 耗时)。必须挂在所有路由之前,
+// 否则先注册的路由命中后不会经过此中间件,API 请求将永远无日志(实测踩过)
+app.use((req, res, next) => {
+	const start = Date.now();
+	res.on("finish", () => {
+		console.log(
+			`[req] ${new Date().toISOString()} ${req.ip} ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`,
+		);
+	});
+	next();
+});
+
 app.get("/healthz", (_req, res) => {
 	res.json({ ok: true });
 });
@@ -117,6 +131,27 @@ app.get("/api/device/:deviceId/frame", async (req, res, next) => {
 		next(err);
 	}
 });
+
+// APK 分发(路线 B:设备无 adb 时的安装通道)
+const PUBLIC_DIR = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"public",
+);
+const APK_PATH = path.join(PUBLIC_DIR, "LeafDashboard.apk");
+
+// /download:APK 直链下载(显式指定 E-Ink 设备浏览器可识别的 MIME)
+app.get("/download", (_req, res) => {
+	res.setHeader("Content-Type", "application/vnd.android.package-archive");
+	res.download(APK_PATH, "LeafDashboard.apk", (err) => {
+		if (err && !res.headersSent) {
+			res.status(err.status || 500).json({ error: "apk not found" });
+		}
+	});
+});
+
+// 静态分发 public/(index.html 安装引导页;需在 404 兜底之前挂载)
+app.use(express.static(PUBLIC_DIR));
 
 // 404 兜底:统一 JSON,避免客户端解析到 HTML
 app.use((_req, res) => {

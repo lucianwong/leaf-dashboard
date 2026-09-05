@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 刷新按钮背景:白色半透明圆形 + 细黑描边(E-Ink 上清晰可辨) -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#E6FFFFFF" />
+    <stroke
+        android:width="2dp"
+        android:color="#000000" />
+</shape>

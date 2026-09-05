@@ -54,6 +54,10 @@ sips -g pixelWidth -g pixelHeight frame.png
 
 可选参数 `?page=home`(M4 多页面之前任意 page 均渲染同一测试布局,page 名显示在角标)。
 
+## APK 分发(路线 B)
+
+设备无 adb 时,可直接浏览器打开 `http://<server-ip>:39871/` 进入安装引导页(极简黑白页),点击"下载 LeafDashboard APK"即下载;APK 直链为 `/download`(MIME:`application/vnd.android.package-archive`)。APK 文件放在 `server/public/LeafDashboard.apk`(构建产物,不入库,更新后重新复制即可)。
+
 ## Docker
 
 ```bash

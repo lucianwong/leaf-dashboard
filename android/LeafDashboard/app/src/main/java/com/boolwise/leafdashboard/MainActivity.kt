@@ -14,6 +14,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Toast
@@ -23,6 +24,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * LeafDashboard 主界面:全屏显示服务端渲染的 1680x1264 E-Ink Frame。
@@ -55,6 +57,9 @@ class MainActivity : Activity() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val ioExecutor = Executors.newSingleThreadExecutor()
+
+    // 刷新防抖:下载/请求进行中重复触屏或重复点按钮直接忽略
+    private val refreshInFlight = AtomicBoolean(false)
     private var currentServerUrl: String = ""
 
     private lateinit var frameDir: File
@@ -86,6 +91,11 @@ class MainActivity : Activity() {
 
         findViewById<Button>(R.id.btn_save).setOnClickListener { onSaveClicked() }
         findViewById<Button>(R.id.btn_skip).setOnClickListener { onSkipClicked() }
+        // 右下角浮动刷新按钮:与触屏手动刷新行为完全一致(含防抖)
+        findViewById<ImageButton>(R.id.btn_refresh).setOnClickListener {
+            Log.d(TAG, "manual refresh by button")
+            pollOnce()
+        }
 
         // 首启动(未做过设置)显示简易设置面板;否则直接进入显示模式
         if (!prefs.getBoolean(KEY_SETUP_DONE, false)) {
@@ -177,13 +187,24 @@ class MainActivity : Activity() {
     }
 
     private fun pollOnce() {
-        // removeCallbacksAndMessages(null) 兼具防抖:连续触屏不会叠加并发刷新
+        // 防抖:已有刷新在进行中(下载/请求未返回)时,重复触屏或重复点按钮直接忽略
+        if (!refreshInFlight.compareAndSet(false, true)) {
+            Log.d(TAG, "refresh already in progress, ignore")
+            return
+        }
+        // 即时反馈:防抖通过、即将执行刷新,让用户点击有感
+        Toast.makeText(this, "正在刷新…", Toast.LENGTH_SHORT).show()
+        // 清除已排队的周期轮询,立即执行本轮
         handler.removeCallbacksAndMessages(null)
         ioExecutor.execute {
             // Activity 已销毁:直接退出,不再 reschedule,避免僵尸轮询与 Activity 泄漏
-            if (isFinishing || isDestroyed) return@execute
+            if (isFinishing || isDestroyed) {
+                refreshInFlight.set(false)
+                return@execute
+            }
             val result = checkAndUpdate()
             runOnUiThread {
+                refreshInFlight.set(false)
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 when (result) {
                     is RefreshResult.Updated -> {
@@ -196,12 +217,14 @@ class MainActivity : Activity() {
 
                     is RefreshResult.Failed -> {
                         Log.w(TAG, "refresh failed: ${result.reason}")
-                        // 无网/失败:保持当前画面不动,仅提示
-                        if (frameCurrent.exists()) {
-                            Toast.makeText(this, "刷新失败,保留当前画面", Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(this, "刷新失败:${result.reason}", Toast.LENGTH_LONG).show()
-                        }
+                        // 无网/失败:保持当前画面不动;reason 区分网络断/超时/服务端错
+                        val msg =
+                            if (frameCurrent.exists()) {
+                                "刷新失败:${result.reason},保留当前画面"
+                            } else {
+                                "刷新失败:${result.reason}"
+                            }
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                     }
                 }
                 scheduleNextPoll()
@@ -242,9 +265,30 @@ class MainActivity : Activity() {
                 }
             }
         } catch (e: Exception) {
-            RefreshResult.Failed("${e.javaClass.simpleName}: ${e.message}")
+            RefreshResult.Failed(describeError(e))
         }
     }
+
+    /** 异常转可读中文:区分无法连接/地址解析失败/超时,其余不裸类名 */
+    private fun describeError(e: Exception): String =
+        when (e) {
+            is java.net.ConnectException -> {
+                "无法连接服务器"
+            }
+
+            is java.net.UnknownHostException -> {
+                "无法解析服务器地址"
+            }
+
+            is java.net.SocketTimeoutException -> {
+                "连接超时"
+            }
+
+            else -> {
+                val detail = e.message
+                if (detail.isNullOrBlank()) e.javaClass.simpleName else "网络错误:$detail"
+            }
+        }
 
     /** 下载 frame:先写 frame_next.png,校验 PNG 魔数后原子替换为 frame_current.png */
     private fun downloadFrame(

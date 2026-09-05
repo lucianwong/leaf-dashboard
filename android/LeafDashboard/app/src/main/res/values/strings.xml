@@ -5,4 +5,5 @@
     <string name="setup_hint">服务端地址,如 http://192.168.3.37:39871</string>
     <string name="setup_save">保存并连接</string>
     <string name="setup_skip">跳过,使用内置默认地址</string>
+    <string name="refresh_cd">手动刷新</string>
 </resources>
