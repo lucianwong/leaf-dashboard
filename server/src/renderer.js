@@ -6,6 +6,7 @@
 //  - 大字号、大留白、清晰框线分区
 
 import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
+import solarlunar from "solarlunar";
 import { getSnapshotData } from "./datasources.js";
 
 export const FRAME_WIDTH = 1680;
@@ -258,6 +259,17 @@ export function renderFrame({ page, version, deviceId, data, now = Date.now() })
 // ---- Home 页:大时钟 + 日期 + 天气/日程/待办三框(占满画布) ----
 function renderHomePage(ctx, d, data) {
 	const M = 48;
+	// 农历(如"丙午年七月廿四"):时钟上方居中;仅中文字体可用时显示
+	if (fonts.hasCJK) {
+		const lunar = solarlunar.solar2lunar(d);
+		drawCenteredText(
+			ctx,
+			`${lunar.gzYear}年${lunar.monthCn}${lunar.dayCn}`,
+			FRAME_WIDTH / 2,
+			170,
+			fontCss(60, { cjk: true }),
+		);
+	}
 	const hh = pad2(d.getHours());
 	const mm = pad2(d.getMinutes());
 	drawCenteredText(
