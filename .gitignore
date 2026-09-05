@@ -1,0 +1,9 @@
+.idea/
+node_modules/
+dist/
+build/
+.gradle/
+local.properties
+*.iml
+.DS_Store
+server/frames/
