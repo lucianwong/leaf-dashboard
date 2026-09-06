@@ -44,20 +44,23 @@
       </thead>
       <tbody></tbody>
     </table>
-    <h2>远程控制(Leaf Runtime 1.0)</h2>
-    <p class="hint">对最近在线的设备下发指令:切页在下次同步时生效;刷新/全刷立即触发一次同步。</p>
+    <h2>远程控制(0.5.0 Command V1)</h2>
+    <p class="hint">统一命令模型:Sent → Received → Succeeded;设备离线时命令保持 pending,恢复后自动执行。</p>
     <label>目标 Device ID <input id="ctlDevice" style="width:22em" placeholder="留空 = 最近在线设备" /></label>
     <p>
-      <button data-page="home">HOME</button>
-      <button data-page="calendar">CALENDAR</button>
-      <button data-page="ai">AI</button>
-      <button data-page="system">SYSTEM</button>
+      <button data-cmd="page.switch" data-page="home">HOME</button>
+      <button data-cmd="page.switch" data-page="calendar">CALENDAR</button>
+      <button data-cmd="page.switch" data-page="ai">AI</button>
+      <button data-cmd="page.switch" data-page="system">SYSTEM</button>
     </p>
     <p>
       <button id="ctlRefresh">刷新</button>
       <button id="ctlFull">全刷</button>
+      <button id="ctlSync">重启同步</button>
       <span id="msgCtl"></span>
     </p>
+    <h3>命令历史</h3>
+    <div id="cmdHist" class="hint"></div>
 
     <h2>刷新配置</h2>
     <label>轮询间隔(秒,60–3600) <input id="poll" type="number" min="60" max="3600" step="30" /></label>
@@ -112,7 +115,8 @@
             (d.online ?? "-") + (d.safeMode ? " ⚠安全模式" : ""),
             fmt(d.lastSeen),
             d.battery != null ? d.battery + "%" + (d.charging ? " ⚡" : "") : "-",
-            (d.appVersion ?? "-") + (d.deviceModel ? " · " + d.deviceModel : ""),
+            (d.appVersion ?? "-") + (d.buildCommit ? " · " + d.buildCommit : "") +
+              (d.deviceModel ? " · " + d.deviceModel : ""),
             d.page ?? "-",
           ];
           for (const text of cells) {
@@ -129,30 +133,38 @@
         return document.getElementById("ctlDevice").value.trim() || window.__latestDevice;
       }
 
-      async function postDesiredPage(page) {
+      // 0.5.0 Command V1:统一命令下发
+      async function postCommand(type, payload) {
         const id = targetDevice();
         if (!id) { document.getElementById("msgCtl").textContent = "暂无设备"; return; }
-        const res = await fetch("api/admin/devices/" + encodeURIComponent(id) + "/desired-page", {
+        const res = await fetch("api/admin/devices/" + encodeURIComponent(id) + "/commands", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ page }),
+          body: JSON.stringify({ type, payload: payload ?? {} }),
         });
         const data = await res.json();
-        document.getElementById("msgCtl").textContent =
-          data.ok ? "已下发切页:" + data.page + " (seq " + data.seq + ")" : "下发失败";
+        document.getElementById("msgCtl").textContent = data.error
+          ? "下发失败:" + data.error
+          : "已下发 " + type + " (seq " + data.seq + ")";
+        loadCommands();
       }
 
-      async function postRefresh(full) {
+      // 命令历史(Sent→Received→Success 时间线,最近 8 条)
+      async function loadCommands() {
         const id = targetDevice();
-        if (!id) { document.getElementById("msgCtl").textContent = "暂无设备"; return; }
-        const res = await fetch("api/admin/devices/" + encodeURIComponent(id) + "/refresh", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ full: Boolean(full) }),
-        });
-        const data = await res.json();
-        document.getElementById("msgCtl").textContent =
-          data.ok ? (full ? "已下发全刷" : "已下发刷新") : "下发失败";
+        if (!id) return;
+        try {
+          const data = await (await fetch("api/admin/devices/" + encodeURIComponent(id) + "/commands")).json();
+          const box = document.getElementById("cmdHist");
+          box.textContent = "";
+          for (const c of data.commands) {
+            const line = document.createElement("div");
+            line.textContent =
+              new Date(c.createdAt).toLocaleTimeString() + "  " +
+              c.type + "  " + (c.status ?? "pending").toUpperCase();
+            box.appendChild(line);
+          }
+        } catch (e) { /* 忽略 */ }
       }
 
       async function loadConfig() {
@@ -248,12 +260,14 @@
       document.getElementById("save").onclick = saveConfig;
       document.getElementById("saveDs").onclick = saveDatasources;
       document.getElementById("reload").onclick = reloadPreview;
-      // 远程控制:切页按钮(data-page)+ 刷新/全刷
-      document.querySelectorAll("button[data-page]").forEach((btn) => {
-        btn.onclick = () => postDesiredPage(btn.dataset.page);
+      // 0.5.0 远程控制:统一命令按钮(data-cmd)+ 命令历史
+      document.querySelectorAll("button[data-cmd]").forEach((btn) => {
+        btn.onclick = () => postCommand(btn.dataset.cmd, { page: btn.dataset.page });
       });
-      document.getElementById("ctlRefresh").onclick = () => postRefresh(false);
-      document.getElementById("ctlFull").onclick = () => postRefresh(true);
+      document.getElementById("ctlRefresh").onclick = () => postCommand("device.refresh");
+      document.getElementById("ctlFull").onclick = () => postCommand("device.full_refresh");
+      document.getElementById("ctlSync").onclick = () => postCommand("sync.restart");
+      setInterval(loadCommands, 30_000);
       loadDevices();
       loadConfig();
       initPages();

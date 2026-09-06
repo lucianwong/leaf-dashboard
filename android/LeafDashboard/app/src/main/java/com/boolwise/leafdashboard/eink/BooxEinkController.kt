@@ -29,6 +29,16 @@ class BooxEinkController(
 
     private var available = false
 
+    // Discovery 结果:候选类命中 → partial 可用;命中无参整刷方法 → full 可用。
+    // 真机日志固化前这是"找到类/方法"级别的判定,不代表波形已验证
+    override val capabilities: Map<String, Boolean>
+        get() = mapOf(
+            "booxPartialAvailable" to available,
+            "booxFullAvailable" to fullMethodFound,
+        )
+
+    private var fullMethodFound = false
+
     override val name: String = "boox"
 
     override fun isAvailable(): Boolean = available
@@ -64,6 +74,7 @@ class BooxEinkController(
                         if (method.parameterTypes.isEmpty()) {
                             method.isAccessible = true
                             method.invoke(null)
+                            fullMethodFound = true
                             Log.i(TAG, "boox full refresh via $className.${method.name}")
                             return true
                         }

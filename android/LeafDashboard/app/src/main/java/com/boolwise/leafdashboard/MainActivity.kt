@@ -19,6 +19,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Toast
 import org.json.JSONObject
+import com.boolwise.leafdashboard.command.CommandLedger
 import com.boolwise.leafdashboard.eink.EinkController
 import com.boolwise.leafdashboard.eink.EinkControllerFactory
 import java.io.File
@@ -134,6 +135,8 @@ class MainActivity : Activity() {
         frameDir = File(filesDir, "frames")
         // 目标目录必须先于迁移创建(rename 跨目录依赖目标存在)
         frameDir.mkdirs()
+        // 命令台账:持久化于 filesDir,重启后依然幂等
+        CommandLedger.init(filesDir)
         // 迁移:0.2.0 及之前所有 frame 都写在 cacheDir 根(frame_current.png /
         // frame_<page>.png / 残留的 frame_next_*.png)。整目录搬到持久目录:
         //  - frame_current.png 语义上就是当前显示页,归位为 frame_home.png
@@ -575,6 +578,10 @@ class MainActivity : Activity() {
                 )
             pendingFullRefresh = dueFull
             val contentVersion = manifest.optLong("contentVersion", 0)
+
+            // 0.5.0 Command V1:执行 manifest 下发的命令(幂等,台账去重)
+            processCommands(manifest.optJSONArray("commands"), pagesArr, frameBase, prefs)
+
             // M7 指标:同步成功 → success 计数 + 清除 lastError
             prefs.edit()
                 .putInt(KEY_SYNC_SUCCESS, prefs.getInt(KEY_SYNC_SUCCESS, 0) + 1)
@@ -598,6 +605,142 @@ class MainActivity : Activity() {
         } finally {
             // 心跳在全部 metrics 更新之后上报;失败路径也照常上报
             postHeartbeat(prefs)
+        }
+    }
+
+    /**
+     * 0.5.0 Command V1:执行 manifest 下发的命令。
+     * At-least-once 模型:同一命令可能重复到达,CommandLedger 幂等去重,
+     * 已处理过的直接按台账重发 ACK,不重复执行。IO 线程调用。
+     */
+    private fun processCommands(
+        commands: org.json.JSONArray,
+        pagesArr: org.json.JSONArray?,
+        frameBase: String,
+        prefs: android.content.SharedPreferences,
+    ) {
+        for (k in 0 until commands.length()) {
+            val cmd = commands.optJSONObject(k) ?: continue
+            val id = cmd.optString("id")
+            val type = cmd.optString("type")
+            val payload = cmd.optJSONObject("payload") ?: JSONObject()
+            if (id.isBlank()) continue
+
+            // 幂等:台账命中 → 不重复执行,按记录重发 ACK
+            if (CommandLedger.has(id)) {
+                val st = CommandLedger.statusOf(id) ?: "succeeded"
+                Log.d(TAG, "command $id already $st, re-ack")
+                ackCommand(id, st, null, CommandLedger.resultOf(id))
+                continue
+            }
+            // 过期命令:失败 ACK + 台账
+            val expiresAt = cmd.optLong("expiresAt", 0)
+            if (expiresAt in 1 until System.currentTimeMillis()) {
+                Log.d(TAG, "command $id expired")
+                ackCommand(id, "failed", "expired")
+                CommandLedger.record(id, "failed", error = "expired")
+                continue
+            }
+
+            Log.i(TAG, "command $id [$type] received")
+            ackCommand(id, "received")
+
+            var finalStatus = "succeeded"
+            var finalError: String? = null
+            val result = JSONObject()
+            when (type) {
+                "page.switch" -> {
+                    val targetPage = payload.optString("page")
+                    if (targetPage in pages) {
+                        currentPage = targetPage
+                        prefs.edit().putString(KEY_CURRENT_PAGE, targetPage).apply()
+                        runOnUiThread { showCachedFrame(targetPage) }
+                        result.put("page", targetPage)
+                    } else {
+                        finalStatus = "failed"
+                        finalError = "unknown_page"
+                    }
+                }
+
+                "device.refresh" -> {
+                    // 强制重拉当前页(忽略本地 version 差异)
+                    val cur = findPageEntry(pagesArr, currentPage)
+                    if (
+                        cur != null &&
+                        downloadFrame(
+                            currentPage,
+                            "$currentServerUrl$frameBase/$currentPage.png",
+                            cur.optLong("version", -1L),
+                            cur.optString("sha256"),
+                        )
+                    ) {
+                        setLastVersion(prefs, currentPage, cur.optLong("version", -1L))
+                        result.put("refresh", "partial")
+                    } else {
+                        finalStatus = "failed"
+                        finalError = lastDlReason ?: "frame_not_available"
+                    }
+                }
+
+                "device.full_refresh" -> {
+                    // 台账先记 succeeded(乐观):回退实现必然完成,300ms 窗口内
+                    // 重复下发命中台账不再二次执行
+                    CommandLedger.record(id, "succeeded", JSONObject().put("refresh", "full"))
+                    runOnUiThread {
+                        performEinkFullRefresh(0L)
+                    }
+                    result.put("refresh", "full")
+                }
+
+                "sync.restart" -> {
+                    handler.postDelayed({ pollOnce() }, 500)
+                    result.put("restarted", true)
+                }
+
+                else -> {
+                    finalStatus = "failed"
+                    finalError = "unknown_type"
+                }
+            }
+            if (type != "device.full_refresh") {
+                // full_refresh 的台账已乐观记录;其余命令此处记终态
+                CommandLedger.record(id, finalStatus, result, finalError)
+            }
+            ackCommand(id, finalStatus, finalError, if (finalStatus == "succeeded") result else null)
+            Log.i(TAG, "command $id [$type] -> $finalStatus")
+        }
+    }
+
+    /** 从 pages 数组取指定页条目 */
+    private fun findPageEntry(
+        pagesArr: org.json.JSONArray?,
+        page: String,
+    ): org.json.JSONObject? {
+        pagesArr ?: return null
+        for (i in 0 until pagesArr.length()) {
+            val p = pagesArr.optJSONObject(i) ?: continue
+            if (p.optString("id") == page) return p
+        }
+        return null
+    }
+
+    /** ACK 上报(失败仅记日志:服务端 At-least-once 会重发,台账保证幂等) */
+    private fun ackCommand(
+        commandId: String,
+        status: String,
+        error: String? = null,
+        result: JSONObject? = null,
+    ) {
+        try {
+            val body = JSONObject().put("status", status)
+            error?.let { body.put("error", it) }
+            result?.let { body.put("result", it) }
+            httpPostJson(
+                "$currentServerUrl/api/device/${deviceId(prefs())}/commands/$commandId/ack",
+                body,
+            )
+        } catch (e: Exception) {
+            Log.d(TAG, "ack $commandId failed: ${e.message}")
         }
     }
 
@@ -736,6 +879,17 @@ class MainActivity : Activity() {
             // 存活心跳(healthy-run 判定依据)
             prefs.edit().putLong(KEY_LAST_ALIVE_AT, System.currentTimeMillis()).apply()
 
+            // 0.5.0 Capability Negotiation:服务端据此选择控制方式
+            // (commands-v1 vs 旧 desiredPage/seq 信号)
+            val capabilities = org.json.JSONArray()
+            capabilities.put("commands-v1")
+            for ((cap, ok) in eink.capabilities) {
+                if (ok) capabilities.put(cap)
+            }
+            if (eink.capabilities["booxFullAvailable"] == true) {
+                capabilities.put("eink-native-v1")
+            }
+
             val body = JSONObject()
                 .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("buildCommit", BuildConfig.BUILD_COMMIT)
@@ -768,6 +922,7 @@ class MainActivity : Activity() {
                 .put("einkController", eink.name)
                 .put("einkAvailable", eink.isAvailable())
                 .put("einkMode", "normal")
+                .put("capabilities", capabilities)
             httpPostJson("$currentServerUrl/api/device/${deviceId(prefs)}/heartbeat", body)
         } catch (e: Exception) {
             Log.d(TAG, "heartbeat failed: ${e.message}")
@@ -833,10 +988,15 @@ class MainActivity : Activity() {
 
     /** E-Ink 整屏刷新(M9):走 EinkController(BOOX 优先,Generic 白黑帧兜底)。
      *  metrics 与远程 seq 固化一律在 onComplete(整刷真正完成)时更新,
-     *  fullSeq 由调用方捕获传入,异步 callback 不依赖全局可变状态 */
-    private fun performEinkFullRefresh(fullSeq: Long) {
+     *  fullSeq 由调用方捕获传入,异步 callback 不依赖全局可变状态。
+     *  onComplete 供 Command 模型在真正完成后 ACK(需自行切 IO 线程) */
+    private fun performEinkFullRefresh(
+        fullSeq: Long,
+        onComplete: () -> Unit = {},
+    ) {
         if (!fullRefreshInFlight.compareAndSet(false, true)) {
             Log.d(TAG, "full refresh already in flight, skip")
+            onComplete()
             return
         }
         Log.i(TAG, "eink full refresh requested via ${eink.name}")
@@ -856,6 +1016,7 @@ class MainActivity : Activity() {
                 prefs().edit().putLong(KEY_LAST_FULL_SEQ, fullSeq).apply()
             }
             fullRefreshInFlight.set(false)
+            onComplete()
         }
     }
 

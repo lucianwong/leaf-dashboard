@@ -23,6 +23,10 @@ interface EinkController {
     /** 控制器名(心跳 einkController 字段) */
     val name: String
 
+    /** 能力声明(心跳遥测):如 booxPartialAvailable / booxFullAvailable */
+    val capabilities: Map<String, Boolean>
+        get() = emptyMap()
+
     /** 专有 API 是否真实可用(BOOX 上 false 时调用方应视作 Generic 行为) */
     fun isAvailable(): Boolean
 

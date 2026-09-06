@@ -49,7 +49,19 @@ try {
 	// 无 .env:所有走 env 的凭据项会以"未设置"报错,属正常可选配置
 }
 
+import {
+	initCommandStore,
+	createCommand,
+	listPending,
+	listRecent,
+	markSent,
+	ackCommand,
+	expireSweep,
+	COMMAND_TYPES,
+} from "./commands.js";
+
 initStore();
+initCommandStore();
 startBackgroundRefresh();
 // 与快照同节奏周期渲染落盘(首次在模块尾部定义后立即执行)
 setInterval(() => persistFrames().catch((err) => console.error("[leaf5-dashboard] frame persist:", err.message)), 60_000).unref();
@@ -185,6 +197,13 @@ app.get("/api/device/:deviceId/manifest", async (req, res, next) => {
 		}
 
 		const deviceRec = listDevices().find((d) => d.deviceId === deviceId);
+
+		// 0.5.0 Command V1:过期清理 → 取待下发命令 → 标记 sent。
+		// 旧客户端(0.4.x)会忽略未知 commands 字段,legacy 字段保留兼容
+		expireSweep();
+		const pendingCommands = listPending(deviceId);
+		for (const cmd of pendingCommands) markSent(cmd);
+
 		res.set("Cache-Control", "no-store");
 		res.json({
 			configVersion: getConfigRev(),
@@ -195,6 +214,14 @@ app.get("/api/device/:deviceId/manifest", async (req, res, next) => {
 				? { page: deviceRec.desiredPage, seq: deviceRec.desiredPageSeq ?? 0 }
 				: null,
 			pages,
+			commands: pendingCommands.map((c) => ({
+				id: c.id,
+				seq: c.seq,
+				type: c.type,
+				payload: c.payload ?? {},
+				createdAt: c.createdAt,
+				expiresAt: c.expiresAt,
+			})),
 			// frame 下载基址(设备无关,共享渲染);客户端拼接 ?page=<id>
 			frameBaseUrl: "/api/device/frame",
 			// 远程刷新信号:seq 变化即触发一次同步;fullRefresh 另外要求全刷
@@ -349,6 +376,64 @@ app.post("/api/admin/devices/:deviceId/refresh", express.json(), (req, res) => {
 	const seq = bumpDeviceSignal(deviceId, full ? "fullRefresh" : "refresh");
 	res.json({ ok: true, full, seq });
 });
+
+// ---- 0.5.0 Command V1 ----
+const COMMAND_PAGE_ALIASES = { "page.switch": "page" };
+
+// Admin 创建命令
+app.post("/api/admin/devices/:deviceId/commands", express.json(), (req, res) => {
+	const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
+	const type = req.body?.type;
+	if (!COMMAND_TYPES.includes(type)) {
+		res.status(400).json({ error: "unknown command type" });
+		return;
+	}
+	let payload = {};
+	if (type === "page.switch") {
+		const page = req.body?.payload?.page ?? req.body?.page;
+		if (!PAGES.includes(page)) {
+			res.status(400).json({ error: "unknown page" });
+			return;
+		}
+		payload = { page };
+	}
+	const cmd = createCommand(deviceId, type, payload);
+	res.json({ id: cmd.id, seq: cmd.seq, status: cmd.status });
+});
+
+// Admin 命令历史(最近 8 条,createdAt 倒序)
+app.get("/api/admin/devices/:deviceId/commands", (req, res) => {
+	const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
+	res.set("Cache-Control", "no-store");
+	res.json({ commands: listRecent(deviceId, 8) });
+});
+
+// 设备 ACK:received(收到)/succeeded(执行成功)/failed(执行失败,带 error)
+app.post(
+	"/api/device/:deviceId/commands/:commandId/ack",
+	express.json(),
+	(req, res) => {
+		const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
+		const commandId = String(req.params.commandId).replace(/[^\w-]/g, "");
+		const status = req.body?.status;
+		if (!["received", "succeeded", "failed"].includes(status)) {
+			res.status(400).json({ error: "invalid ack status" });
+			return;
+		}
+		const cmd = ackCommand(
+			deviceId,
+			commandId,
+			status,
+			typeof req.body?.error === "string" ? req.body.error : null,
+			req.body?.result ?? null,
+		);
+		if (!cmd) {
+			res.status(404).json({ error: "command not found" });
+			return;
+		}
+		res.json({ ok: true, status: cmd.status });
+	},
+);
 
 // 静态分发 public/(index.html 安装引导页;需在 404 兜底之前挂载)
 app.use(express.static(PUBLIC_DIR));
