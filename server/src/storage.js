@@ -127,6 +127,7 @@ export function touchDevice(deviceId, { version, page, telemetry } = {}) {
 			"uptimeSec",
 			"pageVersions",
 			"androidVersion",
+			"buildCommit",
 			"deviceModel",
 			"lastSyncAt",
 			"lastSyncStatus",

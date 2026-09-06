@@ -12,12 +12,21 @@ android {
         applicationId = "com.boolwise.leafdashboard"
         minSdk = 28
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.4.0"
+        versionCode = 4
+        versionName = "0.4.1"
 
         // 默认 Dashboard 服务端地址(可被首启动设置里保存的 URL 覆盖)。
         // 换部署环境时改这里,或在 App 首启动界面输入新地址。
         buildConfigField("String", "SERVER_URL", "\"http://192.168.3.37:39871\"")
+        // 构建 commit 短哈希:48h soak 期间 Admin/心跳可辨识设备装的到底是哪一版
+        buildConfigField(
+            "String",
+            "BUILD_COMMIT",
+            "\"${providers.exec {
+                commandLine("git", "rev-parse", "--short", "HEAD")
+                isIgnoreExitValue = true
+            }.standardOutput.asText.get().trim().ifEmpty { "dev" }}\"",
+        )
     }
 
     buildFeatures {

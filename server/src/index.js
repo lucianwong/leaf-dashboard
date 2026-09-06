@@ -235,6 +235,7 @@ app.post("/api/device/:deviceId/heartbeat", express.json(), (req, res) => {
 			uptimeSec: num(body.uptime),
 			pageVersions,
 			androidVersion: str(body.androidVersion),
+			buildCommit: str(body.buildCommit),
 			deviceModel: str(body.deviceModel),
 			lastSyncAt: num(body.lastSyncAt),
 			lastSyncStatus: str(body.lastSyncStatus),

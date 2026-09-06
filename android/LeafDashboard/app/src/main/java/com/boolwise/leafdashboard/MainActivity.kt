@@ -382,8 +382,10 @@ class MainActivity : Activity() {
                         Log.i(TAG, "frame updated to version ${result.version}")
                         if (pendingFullRefresh) {
                             pendingFullRefresh = false
-                            performEinkFullRefresh()
-                            commitFullSeq()
+                            // 捕获本次 seq 传给异步整刷;seq 由 onComplete 唯一 commit
+                            val fullSeq = pendingFullSeq
+                            pendingFullSeq = 0L
+                            performEinkFullRefresh(fullSeq)
                         }
                     }
 
@@ -392,8 +394,9 @@ class MainActivity : Activity() {
                         // 远程全刷/消残影到期即使画面无变化也要执行整刷
                         if (pendingFullRefresh) {
                             pendingFullRefresh = false
-                            performEinkFullRefresh()
-                            commitFullSeq()
+                            val fullSeq = pendingFullSeq
+                            pendingFullSeq = 0L
+                            performEinkFullRefresh(fullSeq)
                         }
                     }
 
@@ -530,9 +533,10 @@ class MainActivity : Activity() {
                         }
                         Log.d(TAG, "sync page '$page' v$version done")
                     } else if (page == currentPage) {
-                        // 当前页下载失败:保留旧画面,不更新版本号
-                        // (refreshSeq 也未 commit,下一轮自动重试)
-                        return RefreshResult.Failed("download failed")
+                        // 当前页下载失败:统一走 catch 收尾(syncFail 计数、
+                        // lastSyncStatus=failed),保证 attempt = success + fail;
+                        // 保留旧画面,refreshSeq 未 commit 下一轮自动重试
+                        throw java.io.IOException("current frame download failed ($page)")
                     }
                 }
             }
@@ -681,17 +685,6 @@ class MainActivity : Activity() {
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
 
-    /** 远程全刷已真正触发,才固化其 seq(失败下轮重试) */
-    private fun commitFullSeq() {
-        if (pendingFullSeq > 0) {
-            getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putLong(KEY_LAST_FULL_SEQ, pendingFullSeq)
-                .apply()
-            pendingFullSeq = 0L
-        }
-    }
-
     /**
      * 心跳上报:电量/充电/WiFi/当前页/各页版本/运行时长,
      * 驱动 Admin 在线状态与远程管理;失败仅记日志。
@@ -720,6 +713,7 @@ class MainActivity : Activity() {
 
             val body = JSONObject()
                 .put("appVersion", BuildConfig.VERSION_NAME)
+                .put("buildCommit", BuildConfig.BUILD_COMMIT)
                 .put("battery", battery)
                 .put("charging", charging)
                 .put("wifi", wifi)
@@ -812,20 +806,26 @@ class MainActivity : Activity() {
         eink.partialRefresh(frameView)
     }
 
-    /** E-Ink 整屏刷新(M9):走 EinkController(BOOX 优先,Generic 白黑帧兜底) */
-    private fun performEinkFullRefresh() {
+    /** E-Ink 整屏刷新(M9):走 EinkController(BOOX 优先,Generic 白黑帧兜底)。
+     *  metrics 与远程 seq 固化一律在 onComplete(整刷真正完成)时更新,
+     *  fullSeq 由调用方捕获传入,异步 callback 不依赖全局可变状态 */
+    private fun performEinkFullRefresh(fullSeq: Long) {
         Log.i(TAG, "eink full refresh requested via ${eink.name}")
-        // 全刷真正执行:计数/时刻/距上次全刷计数都在此刻更新
-        prefs().edit()
-            .putInt(KEY_FULL_REFRESH_COUNT, prefs().getInt(KEY_FULL_REFRESH_COUNT, 0) + 1)
-            .putLong(KEY_LAST_FULL_AT, System.currentTimeMillis())
-            .putInt(KEY_PARTIAL_SINCE_FULL, 0)
-            .putString(KEY_LAST_REFRESH_STRATEGY, "full")
-            .apply()
-        // 回退恢复内容帧时不再触发 partial(display/refresh 解耦),
-        // 完成回调后才 commit 远程全刷 seq
-        eink.fullRefresh(frameView, { showCachedFrame(currentPage, triggerPartial = false) }) {
-            commitFullSeq()
+        // 回退恢复内容帧时不再触发 partial(display/refresh 解耦)
+        eink.fullRefresh(
+            frameView,
+            { showCachedFrame(currentPage, triggerPartial = false) },
+        ) {
+            prefs().edit()
+                .putInt(KEY_FULL_REFRESH_COUNT, prefs().getInt(KEY_FULL_REFRESH_COUNT, 0) + 1)
+                .putLong(KEY_LAST_FULL_AT, System.currentTimeMillis())
+                .putInt(KEY_PARTIAL_SINCE_FULL, 0)
+                .putString(KEY_LAST_REFRESH_STRATEGY, "full")
+                .apply()
+            // 远程全刷指令真正完成后才固化其 seq
+            if (fullSeq > 0) {
+                prefs().edit().putLong(KEY_LAST_FULL_SEQ, fullSeq).apply()
+            }
         }
     }
 
@@ -893,12 +893,8 @@ class MainActivity : Activity() {
             val idx = (pages.indexOf(currentPage) + delta).mod(pages.size)
             currentPage = pages[idx]
             getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_CURRENT_PAGE, currentPage)
-                // 切页也是一次局部刷新(计划 5.3)
-                .putInt(KEY_PARTIAL_TOTAL, prefs().getInt(KEY_PARTIAL_TOTAL, 0) + 1)
-                .putInt(KEY_PARTIAL_SINCE_FULL, prefs().getInt(KEY_PARTIAL_SINCE_FULL, 0) + 1)
-                .apply()
+                .edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
+            // 局刷计数由 showCachedFrame → performPartialRefresh 统一维护
             showCachedFrame(currentPage)
             Log.i(TAG, "switch to page '$currentPage'")
         }
