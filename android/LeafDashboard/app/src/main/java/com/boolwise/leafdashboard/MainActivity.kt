@@ -19,6 +19,8 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Toast
 import org.json.JSONObject
+import com.boolwise.leafdashboard.eink.EinkController
+import com.boolwise.leafdashboard.eink.EinkControllerFactory
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -55,6 +57,18 @@ class MainActivity : Activity() {
         private const val KEY_LAST_REFRESH_SEQ = "last_refresh_seq" // 远程刷新信号
         private const val KEY_LAST_FULL_SEQ = "last_full_seq" // 远程全刷信号
         private const val KEY_APPLIED_DESIRED_SEQ = "applied_desired_seq" // 已应用的远程切页
+        // Leaf Runtime 1.1:M7 稳定性指标 + M8 Crash Guard
+        private const val KEY_RUNTIME_START = "runtime_start_at" // 本次进程启动时刻
+        private const val KEY_CRASH_COUNT = "crash_count" // 疑似连续崩溃计数
+        private const val KEY_SAFE_MODE = "safe_mode" // 安全模式(暂停同步只显缓存)
+        private const val KEY_SYNC_COUNT = "sync_count" // manifest 同步成功次数
+        private const val KEY_SYNC_FAIL_COUNT = "sync_fail_count" // 同步失败次数
+        private const val KEY_DL_COUNT = "frame_dl_count" // frame 下载成功次数
+        private const val KEY_DL_FAIL_COUNT = "frame_dl_fail_count" // frame 下载失败次数
+        private const val KEY_FULL_REFRESH_COUNT = "full_refresh_count" // 全刷执行次数
+        private const val KEY_LAST_ERROR = "last_error" // 最近一次错误摘要
+        private const val KEY_LAST_SYNC_AT = "last_sync_at" // 最近同步时刻
+        private const val KEY_LAST_SYNC_STATUS = "last_sync_status" // success/failed
         private const val POLL_INTERVAL_MS = 5 * 60 * 1000L
         private const val POLL_RETRY_MS = 30 * 1000L // 上轮失败(无网/超时)后的快速重试间隔
         private const val RESUME_POLL_DELAY_MS = 1 * 1000L // 回前台后延迟一点再刷新,避开焦点切换窗口
@@ -86,6 +100,10 @@ class MainActivity : Activity() {
     private var pendingFullRefresh = false
     // 待执行的远程全刷 seq:整刷真正触发后才 commit,失败下轮重试
     private var pendingFullSeq = 0L
+    // E-Ink 控制器(BOOX 优先,Generic 兜底)
+    private lateinit var eink: EinkController
+    // Safe Mode(M8):连续崩溃后暂停同步只显缓存,进程稳定 5 分钟自动退出
+    private var safeMode = false
     // 连续局刷阈值(manifest.refresh.forceFullAfter),超过即触发全刷
     private var forceFullAfter = 12
     // 全刷周期(manifest.refresh.forceFullMinutes)
@@ -151,11 +169,35 @@ class MainActivity : Activity() {
         setupPanel = findViewById(R.id.setup_panel)
         urlInput = findViewById(R.id.url_input)
 
+        // M9:控制器选择(BOOX 优先 + Discovery 日志 + Generic 兜底)
+        eink = EinkControllerFactory.create()
+
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         currentServerUrl = resolveServerUrl(prefs)
         pages = loadPages(prefs)
         currentPage = prefs.getString(KEY_CURRENT_PAGE, null)?.takeIf { it in pages }
             ?: pages.first()
+
+        // M8 Crash Guard:距上次进程启动不足 5 分钟 → 视为疑似崩溃(正常长期
+        // 常驻场景两次启动间隔远大于此);连续 ≥3 次进入 Safe Mode,
+        // 只显示本地缓存、暂停同步,进程稳定 5 分钟后自动恢复正常
+        val now = System.currentTimeMillis()
+        val lastStart = prefs.getLong(KEY_RUNTIME_START, 0)
+        val crashedRecently = lastStart > 0 && now - lastStart < 5 * 60_000L
+        val crashCount = if (crashedRecently) prefs.getInt(KEY_CRASH_COUNT, 0) + 1 else 0
+        safeMode = crashCount >= 3
+        prefs.edit()
+            .putLong(KEY_RUNTIME_START, now)
+            .putInt(KEY_CRASH_COUNT, crashCount)
+            .putBoolean(KEY_SAFE_MODE, safeMode)
+            .apply()
+        if (safeMode) {
+            Log.w(TAG, "entering safe mode (crashCount=$crashCount)")
+            Toast.makeText(this, "连续异常,进入安全模式(仅显示缓存)", Toast.LENGTH_LONG).show()
+        }
+        if (crashedRecently || safeMode) {
+            Log.i(TAG, "start: crashedRecently=$crashedRecently crashCount=$crashCount safeMode=$safeMode")
+        }
 
         findViewById<Button>(R.id.btn_save).setOnClickListener { onSaveClicked() }
         findViewById<Button>(R.id.btn_skip).setOnClickListener { onSkipClicked() }
@@ -170,8 +212,22 @@ class MainActivity : Activity() {
             urlInput.setText(currentServerUrl)
             setupPanel.visibility = View.VISIBLE
         } else {
+            // 启动原则:先显示本地缓存,不等网络
             showCachedFrame(currentPage)
-            scheduleNextPoll()
+            if (safeMode) {
+                // Safe Mode:暂停同步;进程稳定 5 分钟自动退出恢复轮询
+                handler.postDelayed({
+                    Log.i(TAG, "safe mode stable 5min, resuming normal sync")
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_SAFE_MODE, false)
+                        .putInt(KEY_CRASH_COUNT, 0)
+                        .apply()
+                    safeMode = false
+                    if (!isFinishing && !isDestroyed) pollOnce()
+                }, 5 * 60_000L)
+            } else {
+                scheduleNextPoll()
+            }
         }
     }
 
@@ -279,6 +335,11 @@ class MainActivity : Activity() {
      * 才弹 Toast 反馈;自动轮询/翻页触发的拉取完全静默,不遮挡画面
      */
     private fun pollOnce(manual: Boolean = false) {
+        // Safe Mode:暂停一切同步,只保留本地画面与最小心跳
+        if (safeMode) {
+            Log.d(TAG, "safe mode, skip sync")
+            return
+        }
         // 防抖:已有刷新在进行中(下载/请求未返回)时,重复触屏或重复点按钮直接忽略
         if (!refreshInFlight.compareAndSet(false, true)) {
             Log.d(TAG, "refresh already in progress, ignore")
@@ -363,6 +424,8 @@ class MainActivity : Activity() {
         pendingFullSeq = 0L
         return try {
             val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
+            // M7 指标:同步成功计数
+            prefs.edit().putInt(KEY_SYNC_COUNT, prefs.getInt(KEY_SYNC_COUNT, 0) + 1).apply()
 
             // 配置版本(内容 hash 字符串)变化 → 应用刷新策略(轮询间隔/全刷阈值/周期)
             // 升级迁移:0.2.0 曾以 Int 存储旧版递增计数,getString 会抛
@@ -479,9 +542,22 @@ class MainActivity : Activity() {
             }
             pendingFullRefresh = dueFull
             val contentVersion = manifest.optLong("contentVersion", 0)
+            // M7 指标:同步成功收尾
+            prefs.edit()
+                .putLong(KEY_LAST_SYNC_AT, System.currentTimeMillis())
+                .putString(KEY_LAST_SYNC_STATUS, "success")
+                .apply()
             if (currentUpdated) RefreshResult.Updated(contentVersion) else RefreshResult.Unchanged(0)
         } catch (e: Exception) {
-            RefreshResult.Failed(describeError(e))
+            // M7 指标:同步失败计数 + 错误摘要
+            val reason = describeError(e)
+            prefs.edit()
+                .putInt(KEY_SYNC_FAIL_COUNT, prefs.getInt(KEY_SYNC_FAIL_COUNT, 0) + 1)
+                .putLong(KEY_LAST_SYNC_AT, System.currentTimeMillis())
+                .putString(KEY_LAST_SYNC_STATUS, "failed")
+                .putString(KEY_LAST_ERROR, reason)
+                .apply()
+            RefreshResult.Failed(reason)
         }
     }
 
@@ -516,6 +592,7 @@ class MainActivity : Activity() {
         version: Long,
         expectedSha: String,
     ): Boolean {
+        val prefs = prefs()
         val frameTarget = frameFile(page)
         val frameTemp = File(frameDir, "frame_next_$page.png")
         return try {
@@ -531,37 +608,51 @@ class MainActivity : Activity() {
             if (expectedSha.isNotBlank() && sha256Hex(bytes) != expectedSha) {
                 Log.w(TAG, "frame '$page' sha256 mismatch, discard")
                 frameTemp.delete()
-                return false
+                return markDlFail(prefs, "sha256 mismatch ($page)")
             }
             if (bytes.size <= 8 || !bytes.startsWith(PNG_MAGIC)) {
                 Log.w(TAG, "downloaded frame is not a valid PNG (${bytes.size} bytes), discard")
                 frameTemp.delete()
-                return false
+                return markDlFail(prefs, "invalid png ($page)")
             }
 
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             if (bitmap == null) {
                 Log.w(TAG, "PNG decode failed, discard")
                 frameTemp.delete()
-                return false
+                return markDlFail(prefs, "png decode failed ($page)")
             }
 
             // 同目录 rename 为原子操作:替换完成后才展示,失败不清空当前画面
             if (!frameTemp.renameTo(frameTarget)) {
                 Log.w(TAG, "rename frame_next_$page -> frame_$page failed")
-                return false
+                return markDlFail(prefs, "rename failed ($page)")
             }
             // 只在展示中的页面下载完成后才贴图,后台预取页只落盘不扰动当前画面
             if (page == currentPage) {
                 runOnUiThread { showBitmap(bitmap) }
             }
             Log.i(TAG, "frame '$page' v$version saved (${bytes.size} bytes, ${bitmap.width}x${bitmap.height})")
+            // M7 指标:下载成功计数
+            prefs.edit().putInt(KEY_DL_COUNT, prefs.getInt(KEY_DL_COUNT, 0) + 1).apply()
             true
         } catch (e: Exception) {
             Log.w(TAG, "download frame '$page' failed: ${e.message}")
             frameTemp.delete()
-            false
+            return markDlFail(prefs, "download error ($page): ${e.message}")
         }
+    }
+
+    /** M7 指标:下载失败计数 + 错误摘要(恒返回 false,便于失败点内联调用) */
+    private fun markDlFail(
+        prefs: android.content.SharedPreferences,
+        reason: String,
+    ): Boolean {
+        prefs.edit()
+            .putInt(KEY_DL_FAIL_COUNT, prefs.getInt(KEY_DL_FAIL_COUNT, 0) + 1)
+            .putString(KEY_LAST_ERROR, reason)
+            .apply()
+        return false
     }
 
     /** 字节数组的 SHA-256 十六进制串(小写) */
@@ -597,11 +688,13 @@ class MainActivity : Activity() {
             val wifi = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
 
             val pageVersions = JSONObject()
+            var cacheBytes = 0L
             for ((key, value) in prefs.all) {
                 if (key.startsWith(KEY_LAST_VERSION_PREFIX)) {
                     pageVersions.put(key.removePrefix(KEY_LAST_VERSION_PREFIX), value)
                 }
             }
+            frameDir.listFiles()?.forEach { if (it.isFile) cacheBytes += it.length() }
 
             val body = JSONObject()
                 .put("appVersion", BuildConfig.VERSION_NAME)
@@ -611,6 +704,23 @@ class MainActivity : Activity() {
                 .put("currentPage", currentPage)
                 .put("pageVersions", pageVersions)
                 .put("uptime", android.os.SystemClock.elapsedRealtime() / 1000)
+                // Leaf Runtime 1.1:M7/M9 诊断与 E-Ink 指标
+                .put("androidVersion", android.os.Build.VERSION.RELEASE)
+                .put("deviceModel", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+                .put("lastSyncAt", prefs.getLong(KEY_LAST_SYNC_AT, 0))
+                .put("lastSyncStatus", prefs.getString(KEY_LAST_SYNC_STATUS, null) ?: "never")
+                .put("lastError", prefs.getString(KEY_LAST_ERROR, null))
+                .put("frameCacheBytes", cacheBytes)
+                .put("syncCount", prefs.getInt(KEY_SYNC_COUNT, 0))
+                .put("syncFailCount", prefs.getInt(KEY_SYNC_FAIL_COUNT, 0))
+                .put("frameDownloadCount", prefs.getInt(KEY_DL_COUNT, 0))
+                .put("frameDownloadFailCount", prefs.getInt(KEY_DL_FAIL_COUNT, 0))
+                .put("partialRefreshCount", prefs.getInt(KEY_PARTIAL_COUNT, 0))
+                .put("fullRefreshCount", prefs.getInt(KEY_FULL_REFRESH_COUNT, 0))
+                .put("lastFullRefreshAt", prefs.getLong(KEY_LAST_FULL_AT, 0))
+                .put("crashCount", prefs.getInt(KEY_CRASH_COUNT, 0))
+                .put("safeMode", safeMode)
+                .put("einkController", eink.name)
             httpPostJson("$currentServerUrl/api/device/${deviceId(prefs)}/heartbeat", body)
         } catch (e: Exception) {
             Log.d(TAG, "heartbeat failed: ${e.message}")
@@ -645,64 +755,17 @@ class MainActivity : Activity() {
         frameView.setImageBitmap(bitmap)
     }
 
-    /**
-     * E-Ink 整屏刷新(M3,消残影):BOOX 专有 API 无公开文档且随固件变化,
-     * 这里先反射尝试 Onyx 系统接口;全部失败则退回"白→黑→内容"三连贴图,
-     * 利用墨水屏驱动对全黑帧的波形响应模拟整刷。
-     * 真机效果待 Leaf5+ 实测校准,失败只记日志不影响显示链路。
-     */
+    /** E-Ink 整屏刷新(M9):走 EinkController(BOOX 优先,Generic 白黑帧兜底) */
     private fun performEinkFullRefresh() {
-        Log.i(TAG, "eink full refresh requested")
-        if (tryOnyxFullRefresh()) return
-
-        // 兜底:三连贴图模拟整刷。全黑帧会让墨水屏驱动做一次全波形刷新,
-        // 是无 SDK 时的通行做法。临时 Bitmap 用完即回收,间隔期间不响应布局变化。
-        val w = frameView.width
-        val h = frameView.height
-        if (w <= 0 || h <= 0) return
-        val solid: (Int) -> Bitmap = { color ->
-            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { it.eraseColor(color) }
-        }
-        frameView.setImageBitmap(solid(android.graphics.Color.WHITE))
-        frameView.postDelayed({
-            frameView.setImageBitmap(solid(android.graphics.Color.BLACK))
-            frameView.postDelayed({
-                showCachedFrame(currentPage)
-            }, 150)
-        }, 150)
-    }
-
-    /** 反射尝试 Onyx/BOOX 墨水屏整刷接口:任一命中即返回 true */
-    private fun tryOnyxFullRefresh(): Boolean {
-        val candidates = listOf(
-            // Onyx SDK 常见入口:EpdController.refreshScreen / fullRefresh
-            "com.onyx.android.sdk.device.EpdController",
-            "com.onyx.android.sdk.api.device.epd.EpdController",
-        )
-        for (name in candidates) {
-            try {
-                val cls = Class.forName(name)
-                for (method in cls.declaredMethods) {
-                    val n = method.name.lowercase()
-                    if (n == "fullrefresh" || n == "refreshscreen" || n == "fullrefreshwithhistogram") {
-                        // 参数签名各固件不一,能无参调用就调,否则跳过
-                        method.isAccessible = true
-                        if (method.parameterTypes.isEmpty()) {
-                            method.invoke(null)
-                            Log.i(TAG, "eink full refresh via $name.${method.name}")
-                            return true
-                        }
-                    }
-                }
-            } catch (e: Throwable) {
-                Log.d(TAG, "eink api $name unavailable: ${e.javaClass.simpleName}")
-            }
-        }
-        return false
+        Log.i(TAG, "eink full refresh requested via ${eink.name}")
+        prefs().edit().putInt(KEY_FULL_REFRESH_COUNT, prefs().getInt(KEY_FULL_REFRESH_COUNT, 0) + 1).apply()
+        eink.fullRefresh(frameView) { showCachedFrame(currentPage) }
     }
 
     /** 每页独立的 frame 缓存文件 */
     private fun frameFile(page: String): File = File(frameDir, "frame_$page.png")
+
+    private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
 
     private fun lastVersion(
         prefs: android.content.SharedPreferences,

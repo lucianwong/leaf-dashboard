@@ -117,7 +117,32 @@ export function touchDevice(deviceId, { version, page, telemetry } = {}) {
 	if (version != null) rec.lastVersion = version;
 	if (page != null) rec.page = page;
 	if (telemetry) {
-		for (const key of ["appVersion", "battery", "charging", "wifi", "uptimeSec", "pageVersions"]) {
+		// Leaf Runtime 1.1 诊断/E-Ink 指标白名单
+		for (const key of [
+			"appVersion",
+			"battery",
+			"charging",
+			"wifi",
+			"uptimeSec",
+			"pageVersions",
+			"androidVersion",
+			"deviceModel",
+			"lastSyncAt",
+			"lastSyncStatus",
+			"lastError",
+			"frameCacheBytes",
+			"syncCount",
+			"syncFailCount",
+			"frameDownloadCount",
+			"frameDownloadFailCount",
+			"partialRefreshCount",
+			"fullRefreshCount",
+			"lastFullRefreshAt",
+			"crashCount",
+			"safeMode",
+			"einkController",
+			"einkMode",
+		]) {
 			if (telemetry[key] != null) rec[key] = telemetry[key];
 		}
 	}

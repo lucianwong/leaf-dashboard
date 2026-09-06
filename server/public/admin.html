@@ -109,10 +109,10 @@
           // 逐格 textContent 渲染(设备上报字段不可 innerHTML)
           const cells = [
             d.deviceId.slice(0, 8) + "…",
-            (d.online ?? "-"),
+            (d.online ?? "-") + (d.safeMode ? " ⚠安全模式" : ""),
             fmt(d.lastSeen),
             d.battery != null ? d.battery + "%" + (d.charging ? " ⚡" : "") : "-",
-            d.appVersion ?? "-",
+            (d.appVersion ?? "-") + (d.deviceModel ? " · " + d.deviceModel : ""),
             d.page ?? "-",
           ];
           for (const text of cells) {

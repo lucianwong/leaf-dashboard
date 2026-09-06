@@ -222,15 +222,35 @@ app.post("/api/device/:deviceId/heartbeat", express.json(), (req, res) => {
 	}
 	// 当前页白名单校验(设备上报数据不可直接落盘)
 	const currentPage = PAGES.includes(body.currentPage) ? body.currentPage : null;
+	// Leaf Runtime 1.1 诊断/E-Ink 指标:逐字段类型校验后透传给 storage 白名单
+	const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+	const str = (v) => (typeof v === "string" ? v : null);
 	touchDevice(deviceId, {
 		page: currentPage,
 		telemetry: {
-			appVersion: typeof body.appVersion === "string" ? body.appVersion : null,
-			battery: Number.isFinite(Number(body.battery)) ? Number(body.battery) : null,
+			appVersion: str(body.appVersion),
+			battery: num(body.battery),
 			charging: typeof body.charging === "boolean" ? body.charging : null,
 			wifi: typeof body.wifi === "boolean" ? body.wifi : null,
-			uptimeSec: Number.isFinite(Number(body.uptime)) ? Number(body.uptime) : null,
+			uptimeSec: num(body.uptime),
 			pageVersions,
+			androidVersion: str(body.androidVersion),
+			deviceModel: str(body.deviceModel),
+			lastSyncAt: num(body.lastSyncAt),
+			lastSyncStatus: str(body.lastSyncStatus),
+			lastError: str(body.lastError),
+			frameCacheBytes: num(body.frameCacheBytes),
+			syncCount: num(body.syncCount),
+			syncFailCount: num(body.syncFailCount),
+			frameDownloadCount: num(body.frameDownloadCount),
+			frameDownloadFailCount: num(body.frameDownloadFailCount),
+			partialRefreshCount: num(body.partialRefreshCount),
+			fullRefreshCount: num(body.fullRefreshCount),
+			lastFullRefreshAt: num(body.lastFullRefreshAt),
+			crashCount: num(body.crashCount),
+			safeMode: typeof body.safeMode === "boolean" ? body.safeMode : null,
+			einkController: str(body.einkController),
+			einkMode: str(body.einkMode),
 		},
 	});
 	res.json({ ok: true });

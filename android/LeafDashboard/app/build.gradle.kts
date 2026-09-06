@@ -12,8 +12,8 @@ android {
         applicationId = "com.boolwise.leafdashboard"
         minSdk = 28
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.4.0"
 
         // 默认 Dashboard 服务端地址(可被首启动设置里保存的 URL 覆盖)。
         // 换部署环境时改这里,或在 App 首启动界面输入新地址。
