@@ -857,7 +857,17 @@ class MainActivity : Activity() {
     private fun lastVersion(
         prefs: android.content.SharedPreferences,
         page: String,
-    ): Long = prefs.getLong(KEY_LAST_VERSION_PREFIX + page, -1L)
+    ): Long = try {
+        prefs.getLong(KEY_LAST_VERSION_PREFIX + page, -1L)
+    } catch (e: ClassCastException) {
+        // 升级迁移:0.2.0 及之前以 Int 存储分钟版本号,新版本域为
+        // sha256 前缀 Long(可达 2^32-1)。读即迁移,旧值保留为 Long——
+        // 与新版本域数值不重叠,首 轮 sync 会自然比对出新帧并重下
+        val legacy = prefs.getInt(KEY_LAST_VERSION_PREFIX + page, -1)
+        prefs.edit().putLong(KEY_LAST_VERSION_PREFIX + page, legacy.toLong()).apply()
+        Log.i(TAG, "lastVersion '$page' migrated Int -> Long ($legacy)")
+        legacy.toLong()
+    }
 
     private fun setLastVersion(
         prefs: android.content.SharedPreferences,
