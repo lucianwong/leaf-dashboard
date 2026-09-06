@@ -108,6 +108,8 @@ class MainActivity : Activity() {
     private var pendingFullSeq = 0L
     // E-Ink 控制器(BOOX 优先,Generic 兜底)
     private lateinit var eink: EinkController
+    // Generic Full 的白→黑→内容约 300ms 异步窗口:期间忽略用户翻页/手动刷新
+    private val fullRefreshInFlight = AtomicBoolean(false)
     // Safe Mode(M8):连续崩溃后暂停同步只显缓存,进程稳定 5 分钟自动退出
     private var safeMode = false
     // 连续局刷阈值(manifest.refresh.forceFullAfter),超过即触发全刷
@@ -344,9 +346,11 @@ class MainActivity : Activity() {
      */
     private fun pollOnce(manual: Boolean = false) {
         // Safe Mode:safeModeUntil 截止前为 heartbeat-only(设备保持在线可见,
-        // Admin 可看到 safeMode 标记);截止后本函数自动恢复正常同步
+        // Admin 可看到 safeMode 标记);截止后本函数自动恢复正常同步。
+        // heartbeat-only 分支先清旧回调再重排,保证始终只有一条定时链
         if (isSafeModeActive()) {
             Log.d(TAG, "safe mode, heartbeat-only sync")
+            handler.removeCallbacksAndMessages(null)
             ioExecutor.execute {
                 if (isFinishing || isDestroyed) return@execute
                 val p = prefs()
@@ -359,6 +363,13 @@ class MainActivity : Activity() {
         // 防抖:已有刷新在进行中(下载/请求未返回)时,重复触屏或重复点按钮直接忽略
         if (!refreshInFlight.compareAndSet(false, true)) {
             Log.d(TAG, "refresh already in progress, ignore")
+            return
+        }
+        // Full 白黑帧窗口内忽略手动刷新(自动轮询不拦,避免杀死轮询链;
+        // 300ms 窗口与 5 分钟周期碰撞概率极低)
+        if (manual && fullRefreshInFlight.get()) {
+            Log.d(TAG, "full refresh in flight, ignore manual refresh")
+            refreshInFlight.set(false)
             return
         }
         // 即时反馈:仅手动刷新时提示,自动轮询不打扰观看
@@ -488,11 +499,15 @@ class MainActivity : Activity() {
                 val page = dp.optString("page")
                 if (seq > prefs.getLong(KEY_APPLIED_DESIRED_SEQ, 0)) {
                     if (page in pages && page != currentPage) {
-                        currentPage = page
-                        prefs.edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
-                        // 视图操作必须回 UI 线程(sync 在 IO executor 上执行)
-                        runOnUiThread { showCachedFrame(currentPage) }
-                        Log.i(TAG, "remote page switch -> '$currentPage'")
+                        val targetPage = page // 捕获目标页:UI callback 不读可变的 currentPage
+                        currentPage = targetPage
+                        prefs.edit().putString(KEY_CURRENT_PAGE, targetPage).apply()
+                        runOnUiThread {
+                            if (currentPage == targetPage) {
+                                showCachedFrame(targetPage)
+                            }
+                        }
+                        Log.i(TAG, "remote page switch -> '$targetPage'")
                     }
                     prefs.edit().putLong(KEY_APPLIED_DESIRED_SEQ, seq).apply()
                 }
@@ -535,8 +550,9 @@ class MainActivity : Activity() {
                     } else if (page == currentPage) {
                         // 当前页下载失败:统一走 catch 收尾(syncFail 计数、
                         // lastSyncStatus=failed),保证 attempt = success + fail;
+                        // lastDlReason 携带真实原因(sha256/decode/rename 等);
                         // 保留旧画面,refreshSeq 未 commit 下一轮自动重试
-                        throw java.io.IOException("current frame download failed ($page)")
+                        throw java.io.IOException(lastDlReason ?: "current frame download failed ($page)")
                     }
                 }
             }
@@ -652,9 +668,13 @@ class MainActivity : Activity() {
                 Log.w(TAG, "rename frame_next_$page -> frame_$page failed")
                 return markDlFail(prefs, "rename failed ($page)")
             }
-            // 只在展示中的页面下载完成后才贴图,后台预取页只落盘不扰动当前画面
-            if (page == currentPage) {
-                runOnUiThread { showBitmap(bitmap) }
+            // 只在展示中的页面下载完成后才贴图,后台预取页只落盘不扰动当前画面。
+            // page == currentPage 必须在 UI callback 执行时再确认:
+            // IO 线程判断后、UI 贴图前用户可能已切走,旧页贴回会造成画面与状态不一致
+            runOnUiThread {
+                if (page == currentPage) {
+                    showBitmap(bitmap)
+                }
             }
             Log.i(TAG, "frame '$page' v$version saved (${bytes.size} bytes, ${bitmap.width}x${bitmap.height})")
             // M7 指标:下载成功计数
@@ -667,11 +687,16 @@ class MainActivity : Activity() {
         }
     }
 
-    /** M7 指标:下载失败计数 + 错误摘要(恒返回 false,便于失败点内联调用) */
+    /** M7 指标:下载失败计数 + 错误摘要(恒返回 false,便于失败点内联调用)。
+     *  原因同时记入 lastDlReason,当前页失败外层 throw 时携带真实原因,
+     *  避免被 "current frame download failed" 这类笼统消息覆盖 */
+    private var lastDlReason: String? = null
+
     private fun markDlFail(
         prefs: android.content.SharedPreferences,
         reason: String,
     ): Boolean {
+        lastDlReason = reason
         prefs.edit()
             .putInt(KEY_DL_FAIL_COUNT, prefs.getInt(KEY_DL_FAIL_COUNT, 0) + 1)
             .putString(KEY_LAST_ERROR, reason)
@@ -810,6 +835,10 @@ class MainActivity : Activity() {
      *  metrics 与远程 seq 固化一律在 onComplete(整刷真正完成)时更新,
      *  fullSeq 由调用方捕获传入,异步 callback 不依赖全局可变状态 */
     private fun performEinkFullRefresh(fullSeq: Long) {
+        if (!fullRefreshInFlight.compareAndSet(false, true)) {
+            Log.d(TAG, "full refresh already in flight, skip")
+            return
+        }
         Log.i(TAG, "eink full refresh requested via ${eink.name}")
         // 回退恢复内容帧时不再触发 partial(display/refresh 解耦)
         eink.fullRefresh(
@@ -826,6 +855,7 @@ class MainActivity : Activity() {
             if (fullSeq > 0) {
                 prefs().edit().putLong(KEY_LAST_FULL_SEQ, fullSeq).apply()
             }
+            fullRefreshInFlight.set(false)
         }
     }
 
@@ -889,6 +919,11 @@ class MainActivity : Activity() {
      * 循环翻页;只有一页时退化为刷新。
      */
     private fun switchPage(delta: Int) {
+        // Full 白黑帧窗口(约300ms)内忽略翻页,避免显示与指标交叉
+        if (fullRefreshInFlight.get()) {
+            Log.d(TAG, "full refresh in flight, ignore page switch")
+            return
+        }
         if (pages.size > 1) {
             val idx = (pages.indexOf(currentPage) + delta).mod(pages.size)
             currentPage = pages[idx]
