@@ -6,6 +6,9 @@
 //  - 天气用 Open-Meteo:免费、无需 API key,凭据零负担
 //  - 进程内 TTL 缓存 + 最近一次成功值兜底:外部源抖动时画面保持旧数据
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { getConfig } from "./storage.js";
 import { isSafePublicHttpUrl } from "./urlguard.js";
 
@@ -17,12 +20,30 @@ const cache = new Map();
 /** @type {Map<string, any>} 最近一次成功数据(源失败时兜底) */
 const lastGood = new Map();
 
-async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS) {
-	// 请求发起前复核(配置可能在持久化层之外被改动;纵深防御)
-	if (!isSafePublicHttpUrl(url)) throw new Error(`blocked by urlguard: ${url}`);
-	const res = await fetch(url, {
+async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS, extraHeaders = {}) {
+	// 请求发起前就地校验(SSRF 防护,内联原语便于静态验证):
+	// 仅公网 http(s);拒绝 localhost/内网 IPv4 段/环回/链路本地/IPv6 本地/保留域
+	const u = new URL(url);
+	if (u.protocol !== "http:" && u.protocol !== "https:") {
+		throw new Error(`blocked protocol: ${u.protocol}`);
+	}
+	const host = u.hostname;
+	if (
+		/(^|\.)(localhost|local|internal|ip6-localhost)$/i.test(host) ||
+		host === "::1" ||
+		host.startsWith("[::") ||
+		host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80") ||
+		/^(127|10|0)\./.test(host) ||
+		/^169\.254\./.test(host) ||
+		/^192\.168\./.test(host) ||
+		/^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+		/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host)
+	) {
+		throw new Error(`blocked host: ${host}`);
+	}
+	const res = await fetch(u, {
 		signal: AbortSignal.timeout(timeoutMs),
-		headers: { "User-Agent": "leaf5-dashboard/0.1" },
+		headers: { "User-Agent": "leaf5-dashboard/0.1", ...extraHeaders },
 	});
 	if (!res.ok) throw new Error(`HTTP ${res.status}`);
 	return res.text();
@@ -161,21 +182,202 @@ async function probeList(key) {
 export const fetchServers = () => cached("servers", () => probeList("servers"));
 export const fetchAgents = () => cached("agents", () => probeList("agents"));
 
-// ---- AI 用量(任意 JSON 端点) ----
+// ---- AI 用量(codex / zai(GLM) / kimi / custom 通用 JSON) ----
+//
+// 统一产出行结构:{ name, label, plan?, windows: [{label, pct}], text? }
+//  - windows 内 pct 为 0-100 已用百分比,渲染层取最大值当主显示
+//  - 源失败抛错,由 fetchOneAiSource 转为 null,渲染层显示"获取失败"
 
+const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
+// Codex CLI 的公共 OAuth client id(刷新 access_token 用,非机密)
+const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+function aiWindowLabelBySeconds(sec) {
+	if (sec >= 604_800) return "本周";
+	if (sec >= 18_000) return "5小时";
+	const hours = Math.round(sec / 3600);
+	return hours > 0 ? `${hours}小时` : "限时";
+}
+
+// Codex(ChatGPT 订阅):GET wham/usage,Bearer + ChatGPT-Account-Id 双头;
+// access_token 过期(401)时用 refresh_token 换新并原子写回 auth.json,
+// 与 Codex CLI 共享同一份登录态(它自己也会刷新,谁先刷到谁落盘)
+async function fetchCodexUsage() {
+	const authFile = path.join(os.homedir(), ".codex", "auth.json");
+	const auth = JSON.parse(fs.readFileSync(authFile, "utf8"));
+	const tokens = auth.tokens ?? {};
+	if (!tokens.access_token || !tokens.account_id) {
+		throw new Error("auth.json 缺少 access_token/account_id,请先 codex login");
+	}
+
+	async function request(accessToken) {
+		// 端点为代码内常量,仍在发起前就地校验 host(SSRF 纵深防御)
+		if (!isSafePublicHttpUrl(CODEX_USAGE_URL) || !isSafePublicHttpUrl(CODEX_TOKEN_URL)) {
+			throw new Error("codex endpoint blocked by urlguard");
+		}
+		const res = await fetch(CODEX_USAGE_URL, {
+			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+			headers: {
+				Authorization: `Bearer ${accessToken}`,
+				"ChatGPT-Account-Id": tokens.account_id,
+				"User-Agent": "codex_cli_rs/0.48.0",
+			},
+		});
+		return { status: res.status, data: res.ok ? await res.json() : null };
+	}
+
+	let { status, data } = await request(tokens.access_token);
+	if (status === 401 && tokens.refresh_token) {
+		const body = new URLSearchParams({
+			grant_type: "refresh_token",
+			refresh_token: tokens.refresh_token,
+			client_id: CODEX_CLIENT_ID,
+		});
+		const res = await fetch(CODEX_TOKEN_URL, {
+			method: "POST",
+			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body,
+		});
+		if (!res.ok) throw new Error(`codex token refresh HTTP ${res.status}`);
+		const fresh = await res.json();
+		if (!fresh.access_token) throw new Error("codex token refresh 无 access_token");
+		// 原子写回(保持 0600):refresh_token 可能轮换,落盘避免下次又刷
+		const merged = { ...tokens, access_token: fresh.access_token, ...(fresh.refresh_token ? { refresh_token: fresh.refresh_token } : {}) };
+		const tmp = `${authFile}.tmp`;
+		fs.writeFileSync(tmp, JSON.stringify({ ...auth, tokens: merged }, null, 2), { mode: 0o600 });
+		fs.renameSync(tmp, authFile);
+		({ status, data } = await request(fresh.access_token));
+	}
+	if (status !== 200 || !data) throw new Error(`codex usage HTTP ${status}`);
+
+	const rl = data.rate_limit ?? {};
+	const windows = [];
+	for (const w of [rl.primary_window, rl.secondary_window]) {
+		if (w && Number.isFinite(Number(w.used_percent))) {
+			windows.push({
+				label: aiWindowLabelBySeconds(Number(w.limit_window_seconds) || 0),
+				pct: Math.round(Number(w.used_percent)),
+			});
+		}
+	}
+	return {
+		label: "Codex",
+		plan: typeof data.plan_type === "string" ? data.plan_type.toUpperCase() : null,
+		windows,
+	};
+}
+
+// GLM Coding Plan(bigmodel.cn / z.ai):Authorization 直接放 key,无 Bearer 前缀。
+// TOKENS_LIMIT 条目即 token 用量窗口(5h/周),TIME_LIMIT 是 MCP 月度调用,不展示
+async function fetchZaiUsage(url) {
+	const key = process.env.ZAI_API_KEY;
+	if (!key) throw new Error("ZAI_API_KEY 未设置");
+	const j = JSON.parse(await fetchText(url, FETCH_TIMEOUT_MS, { Authorization: key }));
+	if (!j?.success || !j.data) throw new Error(`zai 响应异常: ${j.msg ?? "unknown"}`);
+	const windows = (j.data.limits ?? [])
+		.filter((l) => l?.type === "TOKENS_LIMIT" && Number.isFinite(Number(l.percentage)))
+		.map((l) => ({
+			// unit 实测:3=小时(配 number=5)、6=周;其余码值兜底成原始数字
+			label: l.unit === 3 ? `${l.number}小时` : l.unit === 6 ? "每周" : `窗口${l.unit}`,
+			pct: Math.round(Number(l.percentage)),
+		}));
+	return {
+		label: "GLM",
+		plan: typeof j.data.level === "string" ? j.data.level.toUpperCase() : null,
+		windows,
+	};
+}
+
+// Kimi For Coding:Bearer key;usage 是套餐总额度摘要,limits[] 是滑动窗口;
+// 数值字段全是字符串,统一 Number() 换算;已用百分比 = (limit-remaining)/limit
+function kimiPct(detail) {
+	const limit = Number(detail?.limit);
+	const remaining = Number(detail?.remaining);
+	if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(remaining)) return null;
+	return Math.round(((limit - remaining) / limit) * 100);
+}
+
+function kimiWindowLabel(window) {
+	const dur = Number(window?.duration);
+	const unit = String(window?.timeUnit ?? "");
+	if (!Number.isFinite(dur)) return "限额";
+	if (unit.includes("MINUTE")) return dur >= 60 && dur % 60 === 0 ? `${dur / 60}小时` : `${dur}分钟`;
+	if (unit.includes("HOUR")) return `${dur}小时`;
+	if (unit.includes("WEEK")) return "本周";
+	if (unit.includes("DAY")) return `${dur}天`;
+	if (unit.includes("MONTH")) return "本月";
+	return "限额";
+}
+
+async function fetchKimiUsage(url) {
+	const key = process.env.KIMI_API_KEY ?? process.env.KIMI_CODING_API_KEY;
+	if (!key) throw new Error("KIMI_API_KEY 未设置");
+	const j = JSON.parse(
+		await fetchText(url, FETCH_TIMEOUT_MS, {
+			Authorization: `Bearer ${key}`,
+			"User-Agent": "KimiCLI/1.6",
+		}),
+	);
+	const windows = [];
+	const summaryPct = kimiPct(j.usage);
+	if (summaryPct != null) windows.push({ label: "套餐", pct: summaryPct });
+	for (const item of j.limits ?? []) {
+		const pct = kimiPct(item?.detail);
+		if (pct != null) windows.push({ label: kimiWindowLabel(item?.window), pct });
+	}
+	return { label: "Kimi", plan: null, windows };
+}
+
+// custom:保持 M6 的通用 JSON 约定 {label, used, quota} 或 {label, text}
+async function fetchCustomUsage(url) {
+	const j = JSON.parse(await fetchText(url));
+	return {
+		label: typeof j.label === "string" ? j.label : "AI",
+		text: typeof j.text === "string" ? j.text : null,
+		windows:
+			Number.isFinite(Number(j.used)) && Number.isFinite(Number(j.quota)) && Number(j.quota) > 0
+				? [{ label: "已用", pct: Math.round((Number(j.used) / Number(j.quota)) * 100) }]
+				: Number.isFinite(Number(j.used))
+					? [{ label: "已用", pct: Math.min(100, Math.round(Number(j.used))) }]
+					: [],
+	};
+}
+
+const AI_ADAPTERS = {
+	codex: () => fetchCodexUsage(),
+	zai: (src) => fetchZaiUsage(src.url),
+	kimi: (src) => fetchKimiUsage(src.url),
+	custom: (src) => fetchCustomUsage(src.url),
+};
+
+const AI_SOURCE_LABELS = { codex: "Codex", zai: "GLM", kimi: "Kimi", custom: "AI" };
+
+async function fetchOneAiSource(src) {
+	try {
+		// zai/kimi/custom 的 url 来自 Admin 可写配置,发起前就地校验(SSRF 防护);
+		// codex 无外部 url,走常量端点并在 fetchCodexUsage 内自校验
+		if (src.url && !isSafePublicHttpUrl(src.url)) {
+			console.warn(`[datasource] aiUsage:${src.name} blocked by urlguard`);
+			return null;
+		}
+		const row = await AI_ADAPTERS[src.name](src);
+		if (!row) return null;
+		return { name: src.name, label: AI_SOURCE_LABELS[src.name] ?? src.name, ...row };
+	} catch (err) {
+		console.warn(`[datasource] aiUsage:${src.name} failed: ${err.message}`);
+		return null; // cached() 会自动落到 lastGood 兜底
+	}
+}
+
+/** @returns {Promise<Array<{name, label, plan?, windows?, text?} | null>>} 与配置顺序一致 */
 export function fetchAiUsage() {
-	const { aiUsageUrl } = getConfig();
-	if (!aiUsageUrl) return Promise.resolve(null);
-	return cached("aiUsage", async () => {
-		const j = await fetchJson(aiUsageUrl);
-		// 期望 {label, used, quota} 或 {label, text};字段缺失按 null 交给占位
-		return {
-			label: typeof j.label === "string" ? j.label : "AI",
-			used: Number.isFinite(Number(j.used)) ? Number(j.used) : null,
-			quota: Number.isFinite(Number(j.quota)) ? Number(j.quota) : null,
-			text: typeof j.text === "string" ? j.text : null,
-		};
-	});
+	const sources = getConfig().aiUsage;
+	if (!sources.length) return Promise.resolve([]);
+	return Promise.all(
+		sources.map((src) => cached(`aiUsage:${src.name}:${src.url}`, () => fetchOneAiSource(src))),
+	);
 }
 
 // ---- 快照:后台定时刷新,请求路径只读内存,零网络调用 ----
@@ -213,6 +415,8 @@ async function refreshSnapshot() {
 
 let refreshTimer = null;
 
+let refreshSoonTimer = null;
+
 export function startBackgroundRefresh() {
 	if (refreshTimer) return;
 	// 启动即拉一次(不 await,不阻塞 listen),此后定时刷新
@@ -221,6 +425,15 @@ export function startBackgroundRefresh() {
 		refreshSnapshot().catch(() => {});
 	}, CACHE_TTL_MS);
 	refreshTimer.unref();
+}
+
+// 配置变更后尽快刷新快照(去抖 1s);否则新数据源要等最多 5 分钟才出画面
+export function refreshSoon() {
+	clearTimeout(refreshSoonTimer);
+	refreshSoonTimer = setTimeout(() => {
+		refreshSnapshot().catch(() => {});
+	}, 1_000);
+	refreshSoonTimer.unref?.();
 }
 
 export function getSnapshotData() {

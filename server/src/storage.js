@@ -22,13 +22,19 @@ const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 export const DEFAULT_CONFIG = {
 	pollIntervalSec: 300,
 	fullRefreshIntervalSec: 45 * 60,
-	// 天气:Open-Meteo 免费无 key,只需经纬度(默认杭州)
-	weatherLat: Number(process.env.WEATHER_LAT ?? 30.27) || 30.27,
-	weatherLon: Number(process.env.WEATHER_LON ?? 120.16) || 120.16,
-	// 日历:ICS 订阅链接(WebCal/ICS)
-	icsUrl: process.env.CAL_ICS_URL ?? "",
-	// AI 用量:任意返回 JSON 的用量端点,期望 {label, used, quota} 或 {label, text}
-	aiUsageUrl: process.env.AI_USAGE_URL ?? "",
+	// 天气:Open-Meteo 免费无 key,只需经纬度(默认杭州)。
+	// 不从 env 播种:env 字符串会被污点分析视为不可信输入并流入请求 URL;
+	// 位置改动统一走 Admin 配置(写入时过 urlguard)
+	weatherLat: 30.27,
+	weatherLon: 120.16,
+	// 日历:ICS 订阅链接(经 Admin 配置,写入时过 urlguard)
+	icsUrl: "",
+	// AI 用量源列表:[{name, url}],name 决定解析适配器:
+	//  - codex:免 URL 免 key,读本机 ~/.codex/auth.json 的 ChatGPT 登录态
+	//  - zai:  GLM Coding Plan 用量端点,key 走 env ZAI_API_KEY
+	//  - kimi: Kimi For Coding 用量端点,key 走 env KIMI_API_KEY
+	//  - custom: 任意返回 JSON {label, used, quota} 或 {label, text} 的端点,无鉴权
+	aiUsage: [],
 	// 服务器/Agent 探活列表:[{name, url}]
 	servers: [],
 	agents: [],
@@ -72,7 +78,10 @@ export function initStore() {
 	config.weatherLat = Number.isFinite(Number(saved.weatherLat)) ? Number(saved.weatherLat) : DEFAULT_CONFIG.weatherLat;
 	config.weatherLon = Number.isFinite(Number(saved.weatherLon)) ? Number(saved.weatherLon) : DEFAULT_CONFIG.weatherLon;
 	config.icsUrl = typeof saved.icsUrl === "string" ? saved.icsUrl : "";
-	config.aiUsageUrl = typeof saved.aiUsageUrl === "string" ? saved.aiUsageUrl : "";
+	// 旧版单端点字段迁移:aiUsageUrl -> custom 源(未配置 aiUsage 时一次性迁移)
+	config.aiUsage = sanitizeAiUsage(
+		saved.aiUsage ?? (saved.aiUsageUrl ? [{ name: "custom", url: saved.aiUsageUrl }] : []),
+	);
 	config.servers = sanitizeChecks(saved.servers);
 	config.agents = sanitizeChecks(saved.agents);
 	config.todos = sanitizeTodos(saved.todos);
@@ -84,32 +93,92 @@ function clampInt(v, min, max, fallback) {
 	return n;
 }
 
-/** 设备心跳:status/frame 请求都会走到这里,upsert 并持久化(节流写盘) */
+/** 设备心跳:status/frame/manifest/heartbeat 请求都会走到这里,upsert 并持久化(节流写盘) */
 let dirty = false;
-export function touchDevice(deviceId, { version, page }) {
+export function touchDevice(deviceId, { version, page, telemetry } = {}) {
 	const now = Date.now();
 	const rec = devices.get(deviceId) ?? {
 		firstSeen: now,
 		lastSeen: now,
 		lastVersion: null,
 		page: null,
+		desiredPage: null, // {page, seq}:后台远程切页指令
+		desiredPageSeq: 0,
+		// 运行时遥测(Leaf Runtime 1.0 心跳)
+		appVersion: null,
+		battery: null,
+		charging: null,
+		wifi: null,
+		uptimeSec: null,
+		pageVersions: null,
 	};
 	rec.lastSeen = now;
-	rec.lastVersion = version;
-	rec.page = page;
+	if (version != null) rec.lastVersion = version;
+	if (page != null) rec.page = page;
+	if (telemetry) {
+		for (const key of ["appVersion", "battery", "charging", "wifi", "uptimeSec", "pageVersions"]) {
+			if (telemetry[key] != null) rec[key] = telemetry[key];
+		}
+	}
 	devices.set(deviceId, rec);
 	dirty = true;
+}
+
+/** 远程切页指令:seq 单调递增,客户端只应用比已应用 seq 更新的指令 */
+export function setDesiredPage(deviceId, page) {
+	const rec = devices.get(deviceId) ?? {
+		firstSeen: Date.now(),
+		lastSeen: 0,
+		lastVersion: null,
+		page: null,
+	};
+	rec.desiredPage = page;
+	rec.desiredPageSeq = (rec.desiredPageSeq ?? 0) + 1;
+	devices.set(deviceId, rec);
+	dirty = true;
+	return { page, seq: rec.desiredPageSeq };
+}
+
+/** 远程刷新指令:refresh/fullRefresh 各自 seq 单调递增,客户端感知变化后触发同步 */
+export function bumpDeviceSignal(deviceId, signal) {
+	const rec = devices.get(deviceId) ?? {
+		firstSeen: Date.now(),
+		lastSeen: 0,
+		lastVersion: null,
+		page: null,
+	};
+	const key = signal === "fullRefresh" ? "fullRefreshSeq" : "refreshSeq";
+	rec[key] = (rec[key] ?? 0) + 1;
+	devices.set(deviceId, rec);
+	dirty = true;
+	return rec[key];
+}
+
+/** 设备在线状态:最后心跳 <10min Online,10-30min Stale,>30min Offline */
+function onlineStatus(lastSeen) {
+	if (!lastSeen) return "offline";
+	const min = (Date.now() - lastSeen) / 60_000;
+	if (min < 10) return "online";
+	if (min < 30) return "stale";
+	return "offline";
 }
 
 export function listDevices() {
 	return [...devices.entries()].map(([deviceId, rec]) => ({
 		deviceId,
 		...rec,
+		online: onlineStatus(rec.lastSeen),
 	}));
 }
 
 export function getConfig() {
 	return { ...config };
+}
+
+// 配置版本:每次 updateConfig 递增,manifest.configVersion 据此让客户端感知刷新策略变化
+let configRev = 1;
+export function getConfigRev() {
+	return configRev;
 }
 
 /** 更新配置:逐字段钳制校验,非法字段不报错只忽略,返回生效后的配置 */
@@ -134,16 +203,18 @@ export function updateConfig(patch) {
 		const n = Number(patch.weatherLon);
 		if (Number.isFinite(n) && n >= -180 && n <= 180) config.weatherLon = n;
 	}
-	for (const key of ["icsUrl", "aiUsageUrl"]) {
+	for (const key of ["icsUrl"]) {
 		if (key in patch && typeof patch[key] === "string") {
 			// SSRF 防护:仅接受公网 http(s) URL(Admin 无鉴权,URL 是用户可写输入)
 			const val = patch[key].trim();
 			config[key] = val && isSafePublicHttpUrl(val) ? val : "";
 		}
 	}
+	if ("aiUsage" in patch) config.aiUsage = sanitizeAiUsage(patch.aiUsage);
 	if ("servers" in patch) config.servers = sanitizeChecks(patch.servers);
 	if ("agents" in patch) config.agents = sanitizeChecks(patch.agents);
 	if ("todos" in patch) config.todos = sanitizeTodos(patch.todos);
+	configRev += 1;
 	atomicWrite(CONFIG_FILE, config);
 	return getConfig();
 }
@@ -158,6 +229,27 @@ function sanitizeChecks(raw) {
 		}))
 		.filter((it) => it.name && isSafePublicHttpUrl(it.url))
 		.slice(0, 12);
+}
+
+// AI 用量源:类型白名单内有效;codex 不需要 URL(读本机登录态),
+// 其余类型必须给公网 http(s) URL;同名条目取先出现的那个
+const AI_SOURCE_NAMES = new Set(["codex", "zai", "kimi", "custom"]);
+function sanitizeAiUsage(raw) {
+	if (!Array.isArray(raw)) return [];
+	const seen = new Set();
+	return raw
+		.map((it) => ({
+			name: String(it?.name ?? "").trim().toLowerCase(),
+			url: String(it?.url ?? "").trim(),
+		}))
+		.filter((it) => {
+			if (!AI_SOURCE_NAMES.has(it.name) || seen.has(it.name)) return false;
+			seen.add(it.name);
+			// codex 的 URL 固定走代码内常量;其余源的 URL 必须过 SSRF 防护
+			return it.name === "codex" ? true : isSafePublicHttpUrl(it.url);
+		})
+		.map((it) => ({ name: it.name, url: it.name === "codex" ? "" : it.url }))
+		.slice(0, 6);
 }
 
 // 待办条目:text 截断,done 必须是布尔

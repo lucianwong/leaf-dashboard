@@ -8,3 +8,9 @@ local.properties
 .DS_Store
 server/frames/
 server/public/LeafDashboard.apk
+server/.env
+server/storage/
+
+# 本地工具状态
+.mimosa/
+.serena/

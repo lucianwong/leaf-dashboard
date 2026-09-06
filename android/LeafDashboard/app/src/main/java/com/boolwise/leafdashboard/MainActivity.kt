@@ -49,6 +49,12 @@ class MainActivity : Activity() {
         private const val KEY_LAST_VERSION_PREFIX = "last_version_" // 后拼页面名,每页独立版本跟踪
         private const val KEY_PAGES = "pages" // 服务端下发的页面清单(JSON 数组序列化)
         private const val KEY_CURRENT_PAGE = "current_page"
+        private const val KEY_CONFIG_VERSION = "config_version" // manifest 配置版本
+        private const val KEY_PARTIAL_COUNT = "partial_count" // 连续局刷计数(消残影策略)
+        private const val KEY_LAST_FULL_AT = "last_full_at" // 上次全刷时刻(epoch ms)
+        private const val KEY_LAST_REFRESH_SEQ = "last_refresh_seq" // 远程刷新信号
+        private const val KEY_LAST_FULL_SEQ = "last_full_seq" // 远程全刷信号
+        private const val KEY_APPLIED_DESIRED_SEQ = "applied_desired_seq" // 已应用的远程切页
         private const val POLL_INTERVAL_MS = 5 * 60 * 1000L
         private const val POLL_RETRY_MS = 30 * 1000L // 上轮失败(无网/超时)后的快速重试间隔
         private const val RESUME_POLL_DELAY_MS = 1 * 1000L // 回前台后延迟一点再刷新,避开焦点切换窗口
@@ -74,10 +80,14 @@ class MainActivity : Activity() {
     private var pages: List<String> = listOf(DEFAULT_PAGE)
     private var currentPage: String = DEFAULT_PAGE
 
-    // 轮询间隔由服务端 status 下发统一控制(钳制 1~60 分钟),默认 5 分钟
+    // 轮询间隔由服务端 manifest 下发统一控制(钳制 1~60 分钟),默认 5 分钟
     private var pollIntervalMs: Long = POLL_INTERVAL_MS
-    // 本轮 status 要求 full 刷新(消残影),有新帧贴图后在 UI 线程触发整刷
+    // 本轮 sync 要求 full 刷新(消残影),有新帧贴图后在 UI 线程触发整刷
     private var pendingFullRefresh = false
+    // 连续局刷阈值(manifest.refresh.forceFullAfter),超过即触发全刷
+    private var forceFullAfter = 12
+    // 全刷周期(manifest.refresh.forceFullMinutes)
+    private var forceFullMinutes = 45
 
     private lateinit var frameDir: File
 
@@ -283,11 +293,11 @@ class MainActivity : Activity() {
 
     private sealed interface RefreshResult {
         data class Updated(
-            val version: Int,
+            val version: Long,
         ) : RefreshResult
 
         data class Unchanged(
-            val version: Int,
+            val version: Long,
         ) : RefreshResult
 
         data class Failed(
@@ -296,22 +306,31 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 拉取 status:刷新页面清单,当前页 version 有变化才下载;
-     * 版本推进时顺带把其他页也预取到本地缓存,翻页可离线即时切换
+     * Leaf Runtime 1.0 同步:拉取 manifest,按页 version/sha256 差量下载,
+     * 应用远程切页/刷新指令,最后上报心跳。失败走 Failed(保留旧画面)。
      */
     private fun checkAndUpdate(): RefreshResult {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         return try {
-            val status = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/status")
-            val version = status.getInt("version")
-            // 服务端统一控制轮询节奏与刷新策略(M5)
-            pollIntervalMs = status.optLong("pollIntervalSec", POLL_INTERVAL_MS / 1000)
-                .coerceIn(60, 3600) * 1000
-            val forceFull = status.optString("refresh", "partial") == "full"
+            val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
+
+            // 配置版本变化 → 应用刷新策略(轮询间隔/全刷阈值/全刷周期)
+            val configVersion = manifest.optInt("configVersion", 0)
+            if (configVersion != prefs.getInt(KEY_CONFIG_VERSION, -1)) {
+                prefs.edit().putInt(KEY_CONFIG_VERSION, configVersion).apply()
+                manifest.optJSONObject("refresh")?.let { r ->
+                    pollIntervalMs = r.optLong("pollSeconds", POLL_INTERVAL_MS / 1000)
+                        .coerceIn(60, 3600) * 1000
+                    forceFullAfter = r.optInt("forceFullAfter", 12)
+                    forceFullMinutes = r.optInt("forceFullMinutes", 45)
+                }
+                Log.i(TAG, "config v$configVersion applied (poll=${pollIntervalMs / 1000}s fullAfter=$forceFullAfter fullMin=$forceFullMinutes)")
+            }
 
             // 页面清单以服务端为准;当前页不在清单里时回退首页
-            status.optJSONArray("pages")?.let { arr ->
-                val list = (0 until arr.length()).mapNotNull { arr.optString(it).takeIf(String::isNotBlank) }
+            manifest.optJSONArray("pages")?.let { arr ->
+                val list = (0 until arr.length())
+                    .mapNotNull { arr.optJSONObject(it)?.optString("id")?.takeIf(String::isNotBlank) }
                 if (list.isNotEmpty()) {
                     pages = list
                     prefs.edit().putString(KEY_PAGES, list.joinToString(",")).apply()
@@ -322,25 +341,76 @@ class MainActivity : Activity() {
                 }
             }
 
-            var updated = false
-            // 当前页过期先下,失败不影响其他页预取
-            if (version != lastVersion(prefs, currentPage)) {
-                if (!downloadFrame(currentPage, version)) {
-                    return RefreshResult.Failed("download failed")
-                }
-                setLastVersion(prefs, currentPage, version)
-                updated = true
-            }            // 其余页静默预取(仅日志,不参与结果判定)
-            for (page in pages) {
-                if (page == currentPage) continue
-                if (version != lastVersion(prefs, page) && downloadFrame(page, version)) {
-                    setLastVersion(prefs, page, version)
-                    Log.d(TAG, "prefetch page '$page' v$version done")
+            // 远程切页指令:seq 比已应用的新才执行(先切本地缓存立即显示)
+            manifest.optJSONObject("desiredPage")?.let { dp ->
+                val seq = dp.optLong("seq", 0)
+                val page = dp.optString("page")
+                if (seq > prefs.getLong(KEY_APPLIED_DESIRED_SEQ, 0)) {
+                    if (page in pages && page != currentPage) {
+                        currentPage = page
+                        prefs.edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
+                        showCachedFrame(currentPage)
+                        Log.i(TAG, "remote page switch -> '$currentPage'")
+                    }
+                    prefs.edit().putLong(KEY_APPLIED_DESIRED_SEQ, seq).apply()
                 }
             }
-            // 有新帧且服务端要求 full 时,贴图后做一次整刷消残影
-            pendingFullRefresh = forceFull && updated
-            if (updated) RefreshResult.Updated(version) else RefreshResult.Unchanged(version)
+
+            // 远程刷新/全刷信号:seq 推进即视为有指令
+            val remoteRefresh = manifest.optLong("refreshSeq", 0) > prefs.getLong(KEY_LAST_REFRESH_SEQ, 0)
+            val remoteFull = manifest.optLong("fullRefreshSeq", 0) > prefs.getLong(KEY_LAST_FULL_SEQ, 0)
+            if (remoteRefresh) {
+                prefs.edit().putLong(KEY_LAST_REFRESH_SEQ, manifest.optLong("refreshSeq", 0)).apply()
+            }
+            if (remoteFull) {
+                prefs.edit().putLong(KEY_LAST_FULL_SEQ, manifest.optLong("fullRefreshSeq", 0)).apply()
+            }
+
+            // 按页差量下载:version 与本地记录一致才跳过,sha256 校验失败丢弃
+            val frameBase = manifest.optString("frameBaseUrl", "/api/device/frame")
+            val pagesArr = manifest.optJSONArray("pages")
+            var currentUpdated = false
+            if (pagesArr != null) {
+                for (i in 0 until pagesArr.length()) {
+                    val p = pagesArr.optJSONObject(i) ?: continue
+                    val page = p.optString("id")
+                    val version = p.optLong("version", -1L)
+                    val sha = p.optString("sha256")
+                    if (page.isBlank() || version < 0) continue
+                    if (version == lastVersion(prefs, page)) continue
+                    val url = "$currentServerUrl$frameBase/$page.png"
+                    if (downloadFrame(page, url, version, sha)) {
+                        setLastVersion(prefs, page, version)
+                        if (page == currentPage) currentUpdated = true
+                        Log.d(TAG, "sync page '$page' v$version done")
+                    } else if (page == currentPage) {
+                        // 当前页下载失败:保留旧画面,不更新版本号
+                        return RefreshResult.Failed("download failed")
+                    }
+                }
+            }
+
+            // 心跳上报(失败不影响同步结果)
+            postHeartbeat(prefs)
+
+            // 全刷策略:远程全刷 > 连续局刷达到阈值 > 周期到期(消残影)
+            val now = System.currentTimeMillis()
+            val lastFull = prefs.getLong(KEY_LAST_FULL_AT, 0)
+            val partialCount = prefs.getInt(KEY_PARTIAL_COUNT, 0)
+            val dueFull = currentUpdated && (
+                remoteFull ||
+                    partialCount + 1 >= forceFullAfter ||
+                    now - lastFull >= forceFullMinutes * 60_000L
+                )
+            if (currentUpdated) {
+                prefs.edit()
+                    .putInt(KEY_PARTIAL_COUNT, if (dueFull) 0 else partialCount + 1)
+                    .putLong(KEY_LAST_FULL_AT, if (dueFull) now else lastFull)
+                    .apply()
+            }
+            pendingFullRefresh = dueFull
+            val contentVersion = manifest.optLong("contentVersion", 0)
+            if (currentUpdated) RefreshResult.Updated(contentVersion) else RefreshResult.Unchanged(0)
         } catch (e: Exception) {
             RefreshResult.Failed(describeError(e))
         }
@@ -367,17 +437,20 @@ class MainActivity : Activity() {
             }
         }
 
-    /** 下载指定页 frame:先写 frame_next_<page>.png,校验 PNG 魔数后原子替换 */
+    /**
+     * 下载指定页 frame:写临时文件 → SHA256 校验 → PNG 魔数 → decode → 原子替换。
+     * 任何一步失败保留旧 frame,返回 false。
+     */
     private fun downloadFrame(
         page: String,
-        version: Int,
+        url: String,
+        version: Long,
+        expectedSha: String,
     ): Boolean {
         val frameTarget = frameFile(page)
         val frameTemp = File(frameDir, "frame_next_$page.png")
         return try {
-            val conn =
-                URL("$currentServerUrl/api/device/${deviceId(getSharedPreferences(PREFS, MODE_PRIVATE))}/frame?page=$page")
-                    .openConnection() as HttpURLConnection
+            val conn = URL(url).openConnection() as HttpURLConnection
             conn.connectTimeout = CONNECT_TIMEOUT_MS
             conn.readTimeout = READ_TIMEOUT_MS
             conn.inputStream.use { input ->
@@ -385,6 +458,12 @@ class MainActivity : Activity() {
             } // finally 通过 use 保证流关闭
 
             val bytes = frameTemp.readBytes()
+            // SHA256 完整性校验(manifest 下发的期望值,空则跳过)
+            if (expectedSha.isNotBlank() && sha256Hex(bytes) != expectedSha) {
+                Log.w(TAG, "frame '$page' sha256 mismatch, discard")
+                frameTemp.delete()
+                return false
+            }
             if (bytes.size <= 8 || !bytes.startsWith(PNG_MAGIC)) {
                 Log.w(TAG, "downloaded frame is not a valid PNG (${bytes.size} bytes), discard")
                 frameTemp.delete()
@@ -414,6 +493,64 @@ class MainActivity : Activity() {
             frameTemp.delete()
             false
         }
+    }
+
+    /** 字节数组的 SHA-256 十六进制串(小写) */
+    private fun sha256Hex(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    /**
+     * 心跳上报:电量/充电/WiFi/当前页/各页版本/运行时长,
+     * 驱动 Admin 在线状态与远程管理;失败仅记日志。
+     */
+    private fun postHeartbeat(prefs: android.content.SharedPreferences) {
+        try {
+            val bm = getSystemService(BATTERY_SERVICE) as android.os.BatteryManager
+            val battery = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            val chargeStatus = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_STATUS)
+            val charging = chargeStatus == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                chargeStatus == android.os.BatteryManager.BATTERY_STATUS_FULL
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+            val wifi = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+
+            val pageVersions = JSONObject()
+            for ((key, value) in prefs.all) {
+                if (key.startsWith(KEY_LAST_VERSION_PREFIX)) {
+                    pageVersions.put(key.removePrefix(KEY_LAST_VERSION_PREFIX), value)
+                }
+            }
+
+            val body = JSONObject()
+                .put("appVersion", BuildConfig.VERSION_NAME)
+                .put("battery", battery)
+                .put("charging", charging)
+                .put("wifi", wifi)
+                .put("currentPage", currentPage)
+                .put("pageVersions", pageVersions)
+                .put("uptime", android.os.SystemClock.elapsedRealtime() / 1000)
+            httpPostJson("$currentServerUrl/api/device/${deviceId(prefs)}/heartbeat", body)
+        } catch (e: Exception) {
+            Log.d(TAG, "heartbeat failed: ${e.message}")
+        }
+    }
+
+    /** POST JSON(心跳用);非 2xx 抛异常 */
+    private fun httpPostJson(url: String, body: JSONObject) {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = CONNECT_TIMEOUT_MS
+        conn.readTimeout = READ_TIMEOUT_MS
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        val code = conn.responseCode
+        if (code !in 200..299) {
+            throw java.io.IOException("HTTP $code")
+        }
+        conn.inputStream?.close()
     }
 
     /** 展示指定页的本地缓存;无缓存(首装)则保持黑屏 */
@@ -490,14 +627,14 @@ class MainActivity : Activity() {
     private fun lastVersion(
         prefs: android.content.SharedPreferences,
         page: String,
-    ): Int = prefs.getInt(KEY_LAST_VERSION_PREFIX + page, -1)
+    ): Long = prefs.getLong(KEY_LAST_VERSION_PREFIX + page, -1L)
 
     private fun setLastVersion(
         prefs: android.content.SharedPreferences,
         page: String,
-        version: Int,
+        version: Long,
     ) {
-        prefs.edit().putInt(KEY_LAST_VERSION_PREFIX + page, version).apply()
+        prefs.edit().putLong(KEY_LAST_VERSION_PREFIX + page, version).apply()
     }
 
     /** 读取持久化的页面清单,空/损坏时回退单页 home */

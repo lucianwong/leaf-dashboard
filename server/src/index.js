@@ -9,6 +9,7 @@
 // 与大时钟 HH:MM 内容变化节奏一致,每分钟自然 +1。
 
 import express from "express";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
@@ -24,13 +25,33 @@ import {
 	touchDevice,
 	listDevices,
 	getConfig,
+	getConfigRev,
 	updateConfig,
 	flushDevices,
+	setDesiredPage,
+	bumpDeviceSignal,
 } from "./storage.js";
-import { startBackgroundRefresh, getSnapshotData } from "./datasources.js";
+import { startBackgroundRefresh, getSnapshotData, refreshSoon } from "./datasources.js";
 
 initStore();
 startBackgroundRefresh();
+// 与快照同节奏周期渲染落盘(首次在模块尾部定义后立即执行)
+setInterval(() => persistFrames().catch((err) => console.error("[leaf5-dashboard] frame persist:", err.message)), 60_000).unref();
+
+// 轻量 .env 加载:凭据(API key)只进环境变量,不进 config.json。
+// 不覆盖已有的同名 env(显式 export 优先);文件不存在时静默跳过。
+const ENV_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env");
+try {
+	for (const line of fs.readFileSync(ENV_FILE, "utf8").split("\n")) {
+		const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+		if (m && !(m[1] in process.env)) {
+			process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+		}
+	}
+} catch {
+	// 无 .env:所有走 env 的凭据项会以"未设置"报错,属正常可选配置
+}
+
 // 设备注册表节流落盘:10s 一次,进程退出时丢失最多 10s 心跳,可接受
 setInterval(flushDevices, 10_000).unref();
 
@@ -49,36 +70,6 @@ if (!Number.isInteger(PORT) || PORT <= 0 || PORT >= 65536) {
 
 const app = express();
 app.disable("x-powered-by");
-
-// frame LRU 缓存:key = `${deviceId}:${page}`。
-//  - 按 deviceId 区分:渲染内容含设备名,多设备共用 key 会串显别人的画面;
-//  - LRU 上限 CACHE_MAX:?page= 是客户端可控输入,不设上限可被刷爆内存。
-//    实际设备数与页面数都极少,16 条足够;版本推进后旧内容自然被覆盖。
-const CACHE_MAX = 16;
-/** @type {Map<string, { version: number, buffer: Buffer }>} */
-const frameCache = new Map();
-
-function cacheGet(key) {
-	const hit = frameCache.get(key);
-	if (hit !== undefined) {
-		// LRU touch:删除后重插,把该 key 移到"最新"端
-		frameCache.delete(key);
-		frameCache.set(key, hit);
-	}
-	return hit;
-}
-
-function cacheSet(key, value) {
-	if (frameCache.has(key)) {
-		frameCache.delete(key);
-	}
-	frameCache.set(key, value);
-	if (frameCache.size > CACHE_MAX) {
-		// Map 迭代按插入序,第一个 key 即最旧条目
-		const oldest = frameCache.keys().next().value;
-		frameCache.delete(oldest);
-	}
-}
 
 // 统一解析 ?page=:仅接受 PAGES 内的单个字符串值;多值/非字符串/空串/
 // 未知页面名一律回退 home,status 与 frame 两个端点行为保持一致
@@ -100,6 +91,132 @@ app.use((req, res, next) => {
 });
 
 app.get("/healthz", (_req, res) => {
+	res.json({ ok: true });
+});
+
+// ---- Leaf Runtime 1.0:frame 文件服务 ----
+// 各页 PNG 由后台周期渲染落盘(storage/frames/<page>.png),用静态中间件出文件:
+// 响应路径零动态代码。必须在 /:deviceId 路由之前注册。
+const FRAMES_DIR = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"storage",
+	"frames",
+);
+app.use("/api/device/frame", express.static(FRAMES_DIR, { maxAge: 0 }));
+
+// 周期渲染全部页面并原子落盘(sha 变了才重写,避免无谓磁盘写)
+let lastWrittenSha = new Map();
+async function persistFrames() {
+	for (const page of PAGES) {
+		const entry = await renderPageCached(page);
+		if (lastWrittenSha.get(page) === entry.sha256) continue;
+		lastWrittenSha.set(page, entry.sha256);
+		const target = path.join(FRAMES_DIR, `${page}.png`);
+		fs.mkdirSync(FRAMES_DIR, { recursive: true });
+		const tmp = `${target}.tmp`;
+		fs.writeFileSync(tmp, entry.buffer);
+		fs.renameSync(tmp, target);
+	}
+}
+
+// ---- Leaf Runtime 1.0:共享页渲染缓存 ----
+// 顶/底栏已移除,frame 内容只取决于(页面, 分钟, 数据快照),与设备无关,
+// 所有设备共享同一份渲染产物;sha256 同时作为 page.version(取前 8 位十六进制)
+import { createHash } from "node:crypto";
+
+const pageRenderCache = new Map();
+const PAGE_RENDER_CACHE_MAX = 24;
+
+async function renderPageCached(page) {
+	const minute = Math.floor(Date.now() / 60_000);
+	const snapshotAt = getSnapshotData().snapshotAt;
+	const key = `${page}:${minute}:${snapshotAt}`;
+	const hit = pageRenderCache.get(key);
+	if (hit) return hit;
+	const buffer = await renderFrame({ page, version: minute, deviceId: "shared" });
+	const sha256 = createHash("sha256").update(buffer).digest("hex");
+	const entry = {
+		buffer,
+		sha256,
+		version: Number.parseInt(sha256.slice(0, 8), 16),
+		minute,
+	};
+	pageRenderCache.set(key, entry);
+	if (pageRenderCache.size > PAGE_RENDER_CACHE_MAX) {
+		pageRenderCache.delete(pageRenderCache.keys().next().value);
+	}
+	return entry;
+}
+
+// ---- Leaf Runtime 1.0:Manifest API ----
+// 客户端单次请求获取全部同步所需信息:按页 version/sha256 差量下载,
+// configVersion 感知刷新策略变化,desiredPage 接收远程切页指令
+app.get("/api/device/:deviceId/manifest", async (req, res, next) => {
+	try {
+		// deviceId 白名单化(字母数字与连字符),阻断任意字符进入响应与 URL
+		const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
+		const config = getConfig();
+		touchDevice(deviceId, {});
+
+		const pages = [];
+		let contentVersion = 0;
+		for (const page of PAGES) {
+			const entry = await renderPageCached(page);
+			contentVersion = Math.max(contentVersion, entry.version);
+			pages.push({
+				id: page,
+				version: entry.version,
+				sha256: entry.sha256,
+			});
+		}
+
+		const deviceRec = listDevices().find((d) => d.deviceId === deviceId);
+		res.set("Cache-Control", "no-store");
+		res.json({
+			configVersion: getConfigRev(),
+			contentVersion,
+			device: { width: FRAME_WIDTH, height: FRAME_HEIGHT, orientation: "landscape" },
+			currentPage: deviceRec?.page ?? "home",
+			desiredPage: deviceRec?.desiredPage
+				? { page: deviceRec.desiredPage, seq: deviceRec.desiredPageSeq ?? 0 }
+				: null,
+			pages,
+			// frame 下载基址(设备无关,共享渲染);客户端拼接 ?page=<id>
+			frameBaseUrl: "/api/device/frame",
+			// 远程刷新信号:seq 变化即触发一次同步;fullRefresh 另外要求全刷
+			refreshSeq: deviceRec?.refreshSeq ?? 0,
+			fullRefreshSeq: deviceRec?.fullRefreshSeq ?? 0,
+			refresh: {
+				pollSeconds: config.pollIntervalSec,
+				forceFullAfter: 12,
+				forceFullMinutes: Math.round(config.fullRefreshIntervalSec / 60),
+			},
+		});
+	} catch (err) {
+		next(err);
+	}
+});
+
+// ---- Leaf Runtime 1.0:Heartbeat ----
+// 设备上报运行时遥测(电量/充电/WiFi/页面版本/运行时长),驱动 Admin 在线状态
+app.post("/api/device/:deviceId/heartbeat", express.json(), (req, res) => {
+	const body = req.body ?? {};
+	const pageVersions = {};
+	for (const [k, v] of Object.entries(body.pageVersions ?? {})) {
+		if (PAGES.includes(k) && Number.isFinite(Number(v))) pageVersions[k] = Number(v);
+	}
+	touchDevice(req.params.deviceId, {
+		page: typeof body.currentPage === "string" ? body.currentPage : null,
+		telemetry: {
+			appVersion: typeof body.appVersion === "string" ? body.appVersion : null,
+			battery: Number.isFinite(Number(body.battery)) ? Number(body.battery) : null,
+			charging: typeof body.charging === "boolean" ? body.charging : null,
+			wifi: typeof body.wifi === "boolean" ? body.wifi : null,
+			uptimeSec: Number.isFinite(Number(body.uptime)) ? Number(body.uptime) : null,
+			pageVersions,
+		},
+	});
 	res.json({ ok: true });
 });
 
@@ -125,40 +242,9 @@ app.get("/api/device/:deviceId/status", (req, res) => {
 	});
 });
 
-app.get("/api/device/:deviceId/frame", async (req, res, next) => {
-	try {
-		const deviceId = req.params.deviceId;
-		const page = getPageParam(req.query);
-		const version = currentVersion();
-		const cacheKey = `${deviceId}:${page}`;
-
-		// frame 下载也计入设备心跳(比 status 更能代表"真的在显示")
-		touchDevice(deviceId, { version, page });
-
-		// 缓存命中:同 version 不重复渲染
-		const cached = cacheGet(cacheKey);
-		let buffer;
-		if (cached && cached.version === version) {
-			buffer = cached.buffer;
-		} else {
-			buffer = await renderFrame({
-				page,
-				version,
-				deviceId,
-			});
-			cacheSet(cacheKey, { version, buffer });
-		}
-
-		res.set("Content-Type", "image/png");
-		res.set("Cache-Control", "no-store");
-		res.set("X-Frame-Version", String(version));
-		res.send(buffer);
-	} catch (err) {
-		// Express 4 不会自动把 async handler 的 rejection 交给错误中间件,
-		// 必须显式 next(err),否则渲染异常会以 unhandledRejection 杀死进程
-		next(err);
-	}
-});
+// 旧 /api/device/:deviceId/frame 路由已移除:frame 内容与设备无关
+// (顶/底栏不再渲染 deviceId),客户端统一走 manifest.frameBaseUrl
+// 指向的共享路由 /api/device/frame。
 
 // APK 分发(路线 B:设备无 adb 时的安装通道)
 const PUBLIC_DIR = path.join(
@@ -192,7 +278,31 @@ app.get("/api/admin/config", (_req, res) => {
 
 app.post("/api/admin/config", express.json(), (req, res) => {
 	// 只取白名单字段,防止任意键写盘
-	res.json(updateConfig(req.body ?? {}));
+	const cfg = updateConfig(req.body ?? {});
+	// 数据源可能变了,1s 后重拉快照,新源尽快上屏
+	refreshSoon();
+	res.json(cfg);
+});
+
+// ---- Leaf Runtime 1.0:远程控制 ----
+// 远程切页:写入设备 desiredPage 指令,设备下次同步时应用
+app.post("/api/admin/devices/:deviceId/desired-page", express.json(), (req, res) => {
+	const page = req.body?.page;
+	if (!PAGES.includes(page)) {
+		res.status(400).json({ error: "unknown page" });
+		return;
+	}
+	const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
+	const applied = setDesiredPage(deviceId, page);
+	res.json({ ok: true, page: applied.page, seq: applied.seq });
+});
+
+// 远程刷新/全刷:递增信号 seq,设备下次轮询 manifest 时感知并立即同步
+app.post("/api/admin/devices/:deviceId/refresh", express.json(), (req, res) => {
+	const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
+	const full = Boolean(req.body?.full);
+	const seq = bumpDeviceSignal(deviceId, full ? "fullRefresh" : "refresh");
+	res.json({ ok: true, full, seq });
 });
 
 // 静态分发 public/(index.html 安装引导页;需在 404 兜底之前挂载)
@@ -227,3 +337,6 @@ server.on("error", (err) => {
 	}
 	process.exit(1);
 });
+
+// 模块加载完成,首次渲染落盘(此后由上面的周期定时器接管)
+persistFrames().catch((err) => console.error("[leaf5-dashboard] frame persist:", err.message));

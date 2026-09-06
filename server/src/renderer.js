@@ -291,7 +291,7 @@ function renderHomePage(ctx, d, data) {
 		fontCss(72, { cjk: true }),
 	);
 
-	// ---- 中部分隔线 + 天气/日程/待办三框(数据缺失回退占位) ----
+	// ---- 中部分隔线 + 天气(1 格)/待办(2 格)两框(数据缺失回退占位) ----
 	drawHLine(ctx, 780, M, FRAME_WIDTH - M, 4);
 
 	const boxTop = 820;
@@ -302,8 +302,8 @@ function renderHomePage(ctx, d, data) {
 
 	const widgets = [
 		renderWeatherWidget(ctx, M, boxTop, boxW, boxH, data.weather),
-		renderEventsWidget(ctx, M + boxW + gap, boxTop, boxW, boxH, data.events),
-		renderTodoWidget(ctx, M + 2 * (boxW + gap), boxTop, boxW, boxH, data.todos),
+		// 待办占两格(日程在 calendar 页查看)
+		renderTodoWidget(ctx, M + boxW + gap, boxTop, boxW * 2 + gap, boxH, data.todos),
 	];
 	widgets.forEach((fn) => fn());
 }
@@ -330,30 +330,6 @@ function renderWeatherWidget(ctx, x, y, w, h, weather) {
 	};
 }
 
-function renderEventsWidget(ctx, x, y, w, h, events) {
-	drawFrameBorder(ctx, x, y, w, h, 5);
-	drawText(ctx, t("日程", "EVENTS"), x + 32, y + 56, fontCss(56, { bold: true, cjk: true }));
-	return () => {
-		if (!events || !events.length) {
-			drawCenteredText(
-				ctx,
-				t("暂无日程", "NO EVENTS"),
-				x + w / 2,
-				y + h / 2 + 20,
-				fontCss(44, { cjk: true }),
-			);
-			return;
-		}
-		// 最多 5 条:时间(月/日 时:分)+ 摘要(截断)
-		events.slice(0, 5).forEach((ev, i) => {
-			const ey = y + 160 + i * 58;
-			const when = `${ev.start.getMonth() + 1}/${ev.start.getDate()} ${pad2(ev.start.getHours())}:${pad2(ev.start.getMinutes())}`;
-			drawText(ctx, when, x + 32, ey, fontCss(36, { bold: true }));
-			drawText(ctx, ev.summary.slice(0, 12), x + 190, ey, fontCss(36, { cjk: true }));
-		});
-	};
-}
-
 function renderTodoWidget(ctx, x, y, w, h, todos) {
 	drawFrameBorder(ctx, x, y, w, h, 5);
 	const open = (todos ?? []).filter((it) => !it.done).length;
@@ -363,12 +339,12 @@ function renderTodoWidget(ctx, x, y, w, h, todos) {
 			drawCenteredText(ctx, t("暂无待办", "EMPTY"), x + w / 2, y + h / 2 + 20, fontCss(44, { cjk: true }));
 			return;
 		}
-		// 未完成优先,画 5 条;完成项加删除线前缀(√)
-		const shown = [...todos].sort((a, b) => Number(a.done) - Number(b.done)).slice(0, 5);
+		// 未完成优先,双格宽度可画 6 条、每条更长;完成项加 √ 前缀
+		const shown = [...todos].sort((a, b) => Number(a.done) - Number(b.done)).slice(0, 6);
 		shown.forEach((it, i) => {
-			const ty = y + 160 + i * 58;
+			const ty = y + 150 + i * 47;
 			const mark = it.done ? "√" : "□";
-			const text = it.done ? t(`(已完成) ${it.text}`, `done: ${it.text}`) : it.text.slice(0, 11);
+			const text = it.done ? t(`(已完成) ${it.text}`, `done: ${it.text}`) : it.text.slice(0, 26);
 			drawText(ctx, `${mark} ${text}`, x + 32, ty, fontCss(38, { cjk: true }));
 		});
 	};
@@ -551,16 +527,16 @@ function renderStatusPage(ctx, probes, title) {
 	);
 }
 
-// ---- AI 页:用量(配额进度条,E-Ink 黑白条纹)+ 文本摘要 ----
-function renderAiPage(ctx, usage) {
+// ---- AI 页:每源一行(标签+套餐 / 主百分比 / 条纹进度条 / 窗口明细) ----
+function renderAiPage(ctx, sources) {
 	const M = 48;
 	drawText(ctx, t("AI 用量", "AI USAGE"), M, 150, fontCss(88, { bold: true, cjk: true }));
 	drawHLine(ctx, 230, M, FRAME_WIDTH - M, 4);
 
-	if (!usage) {
+	if (!sources?.length || !sources.some(Boolean)) {
 		drawCenteredText(
 			ctx,
-			t("未配置用量端点,请在 Admin 页填写", "NO ENDPOINT - CONFIGURE IN ADMIN"),
+			t("未配置用量源,请在 Admin 页添加", "NO SOURCE - CONFIGURE IN ADMIN"),
 			FRAME_WIDTH / 2,
 			660,
 			fontCss(48, { cjk: true }),
@@ -568,39 +544,59 @@ function renderAiPage(ctx, usage) {
 		return;
 	}
 
-	drawCenteredText(ctx, usage.label, FRAME_WIDTH / 2, 400, fontCss(64, { cjk: true }));
-
-	if (usage.text) {
-		drawCenteredText(ctx, usage.text.slice(0, 24), FRAME_WIDTH / 2, 600, fontCss(88, { bold: true, cjk: true }));
-	} else if (usage.used != null && usage.quota) {
-		// 大数字 + 黑白进度条(条纹填充,E-Ink 友好)
-		drawCenteredText(
-			ctx,
-			`${usage.used} / ${usage.quota}`,
-			FRAME_WIDTH / 2,
-			620,
-			fontCss(120, { bold: true }),
-		);
-		const barX = 240;
-		const barW = FRAME_WIDTH - 2 * 240;
-		const ratio = Math.min(1, usage.used / usage.quota);
-		const barY = 760;
-		const barH = 80;
-		ctx.lineWidth = 6;
-		ctx.strokeRect(barX, barY, barW, barH);
-		// 条纹填充:每 24px 一根竖线,黑底比例按 ratio
-		const fillW = Math.round(barW * ratio);
-		ctx.save();
-		ctx.beginPath();
-		ctx.rect(barX, barY, fillW, barH);
-		ctx.clip();
-		for (let x = barX; x < barX + fillW; x += 24) {
-			ctx.fillRect(x, barY, 12, barH);
-		}
-		ctx.restore();
-		// 百分比角标
-		drawCenteredText(ctx, `${Math.round(ratio * 100)}%`, FRAME_WIDTH / 2, 940, fontCss(64, { bold: true }));
-	} else if (usage.used != null) {
-		drawCenteredText(ctx, String(usage.used), FRAME_WIDTH / 2, 620, fontCss(120, { bold: true }));
+	const rows = sources.filter(Boolean);
+	// 每源一个行槽;单源时限制内容盒高度并垂直居中,避免一根条拉满全页
+	const top = 320;
+	const slot = (FRAME_HEIGHT - M - top) / rows.length;
+	const innerH = Math.min(slot, 300);
+	for (let i = 0; i < rows.length; i++) {
+		const y = top + i * slot + Math.max(0, (slot - innerH) / 2);
+		renderAiRow(ctx, rows[i], y, innerH, M);
 	}
+}
+
+// 单源一行;windows 内 pct 为 0-100 已用百分比,主显示取最大(最紧)窗口
+function renderAiRow(ctx, row, y, h, M) {
+	const right = FRAME_WIDTH - M;
+	const labelCss = fontCss(60, { bold: true, cjk: true });
+
+	const mainPct = (row.windows ?? []).reduce((acc, w) => Math.max(acc, w?.pct ?? 0), -1);
+	if (mainPct < 0) {
+		// 无窗口数据:文本型源显示 text,拉取失败显示"获取失败"
+		drawText(ctx, row.label, M, y + 74, labelCss);
+		drawText(
+			ctx,
+			row.text ? row.text.slice(0, 16) : t("获取失败", "FAILED"),
+			right,
+			y + 74,
+			fontCss(row.text ? 72 : 52, { bold: Boolean(row.text), cjk: true }),
+			"right",
+		);
+		return;
+	}
+
+	drawText(ctx, row.plan ? `${row.label} ${row.plan}` : row.label, M, y + 74, labelCss);
+	drawText(ctx, `${mainPct}%`, right, y + 78, fontCss(100, { bold: true }), "right");
+
+	// 条纹填充进度条(黑白,E-Ink 友好)
+	const barX = M;
+	const barW = FRAME_WIDTH - 2 * M;
+	const barY = y + 128;
+	const barH = 44;
+	ctx.lineWidth = 6;
+	ctx.strokeRect(barX, barY, barW, barH);
+	const ratio = Math.min(1, Math.max(0, mainPct / 100));
+	const fillW = Math.round(barW * ratio);
+	ctx.save();
+	ctx.beginPath();
+	ctx.rect(barX, barY, fillW, barH);
+	ctx.clip();
+	for (let x = barX; x < barX + fillW; x += 28) {
+		ctx.fillRect(x, barY, 14, barH);
+	}
+	ctx.restore();
+
+	// 各窗口明细(如 "5小时 0% · 本周 97%")
+	const detail = row.windows.map((w) => `${w.label} ${w.pct}%`).join(" · ");
+	drawText(ctx, detail, right, y + h - 60, fontCss(40, { cjk: true }), "right");
 }
