@@ -33,13 +33,10 @@ import {
 } from "./storage.js";
 import { startBackgroundRefresh, getSnapshotData, refreshSoon } from "./datasources.js";
 
-initStore();
-startBackgroundRefresh();
-// 与快照同节奏周期渲染落盘(首次在模块尾部定义后立即执行)
-setInterval(() => persistFrames().catch((err) => console.error("[leaf5-dashboard] frame persist:", err.message)), 60_000).unref();
-
 // 轻量 .env 加载:凭据(API key)只进环境变量,不进 config.json。
 // 不覆盖已有的同名 env(显式 export 优先);文件不存在时静默跳过。
+// 必须在 initStore/startBackgroundRefresh 之前执行,否则首次快照
+// 拉取时 ZAI_API_KEY/KIMI_API_KEY 尚未就位(AI 源会白失败一轮)
 const ENV_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env");
 try {
 	for (const line of fs.readFileSync(ENV_FILE, "utf8").split("\n")) {
@@ -51,6 +48,11 @@ try {
 } catch {
 	// 无 .env:所有走 env 的凭据项会以"未设置"报错,属正常可选配置
 }
+
+initStore();
+startBackgroundRefresh();
+// 与快照同节奏周期渲染落盘(首次在模块尾部定义后立即执行)
+setInterval(() => persistFrames().catch((err) => console.error("[leaf5-dashboard] frame persist:", err.message)), 60_000).unref();
 
 // 设备注册表节流落盘:10s 一次,进程退出时丢失最多 10s 心跳,可接受
 setInterval(flushDevices, 10_000).unref();
@@ -117,6 +119,17 @@ async function persistFrames() {
 		const tmp = `${target}.tmp`;
 		fs.writeFileSync(tmp, entry.buffer);
 		fs.renameSync(tmp, target);
+	}
+	// 清理已下线页面的残留文件(页面模型收口后 servers/agents.png 等)
+	try {
+		for (const f of fs.readdirSync(FRAMES_DIR)) {
+			if (f.endsWith(".png")) {
+				const page = f.replace(/\.png$/, "");
+				if (!PAGES.includes(page)) fs.rmSync(path.join(FRAMES_DIR, f), { force: true });
+			}
+		}
+	} catch {
+		// 清理失败不影响主流程
 	}
 }
 
@@ -202,12 +215,15 @@ app.get("/api/device/:deviceId/manifest", async (req, res, next) => {
 // 设备上报运行时遥测(电量/充电/WiFi/页面版本/运行时长),驱动 Admin 在线状态
 app.post("/api/device/:deviceId/heartbeat", express.json(), (req, res) => {
 	const body = req.body ?? {};
+	const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
 	const pageVersions = {};
 	for (const [k, v] of Object.entries(body.pageVersions ?? {})) {
 		if (PAGES.includes(k) && Number.isFinite(Number(v))) pageVersions[k] = Number(v);
 	}
-	touchDevice(req.params.deviceId, {
-		page: typeof body.currentPage === "string" ? body.currentPage : null,
+	// 当前页白名单校验(设备上报数据不可直接落盘)
+	const currentPage = PAGES.includes(body.currentPage) ? body.currentPage : null;
+	touchDevice(deviceId, {
+		page: currentPage,
 		telemetry: {
 			appVersion: typeof body.appVersion === "string" ? body.appVersion : null,
 			battery: Number.isFinite(Number(body.battery)) ? Number(body.battery) : null,
@@ -221,10 +237,12 @@ app.post("/api/device/:deviceId/heartbeat", express.json(), (req, res) => {
 });
 
 app.get("/api/device/:deviceId/status", (req, res) => {
+	// deviceId 白名单化(与其他端点一致)
+	const deviceId = String(req.params.deviceId).replace(/[^\w-]/g, "");
 	const version = currentVersion();
 	const page = getPageParam(req.query);
 	const config = getConfig();
-	touchDevice(req.params.deviceId, { version, page });
+	touchDevice(deviceId, { version, page });
 	res.set("Cache-Control", "no-store");
 	res.json({
 		version,

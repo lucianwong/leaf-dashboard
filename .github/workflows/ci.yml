@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install dependencies (clean)
+        run: npm ci
+      - name: Syntax check all sources
+        run: for f in src/*.js; do node --check "$f"; done
+      - name: Renderer smoke test (all pages)
+        run: |
+          node --input-type=module -e "
+            import('./src/renderer.js').then(async (m) => {
+              for (const p of m.PAGES) {
+                const buf = await m.renderFrame({ page: p, version: 1, deviceId: 'ci' });
+                if (buf.length < 10000) throw new Error('page ' + p + ' rendered too small');
+              }
+              console.log('pages ok:', m.PAGES.join(','));
+            })
+          "
+      - name: Server startup test
+        run: |
+          node src/index.js &
+          SERVER_PID=$!
+          sleep 3
+          curl -fsS http://127.0.0.1:39871/healthz
+          curl -fsS "http://127.0.0.1:39871/api/device/ci/manifest" > /dev/null
+          curl -fsS -o /dev/null "http://127.0.0.1:39871/api/device/frame/home.png"
+          kill $SERVER_PID
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build debug APK
+        working-directory: android/LeafDashboard
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ./gradlew assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeafDashboard-debug
+          path: android/LeafDashboard/app/build/outputs/apk/debug/app-debug.apk

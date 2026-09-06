@@ -12,10 +12,9 @@ import { getSnapshotData } from "./datasources.js";
 export const FRAME_WIDTH = 1680;
 export const FRAME_HEIGHT = 1264;
 
-// 页面清单(M4 多页面):客户端据此预取与本地缓存,顺序即翻页顺序。
-// calendar 为真实月历(纯服务端可算),ai/servers/agents 暂为占位页,
-// 数据源接入后逐页替换实现。
-export const PAGES = ["home", "calendar", "ai", "servers", "agents"];
+// 页面清单(Leaf Runtime 1.0 收口为四页):客户端据此预取与本地缓存,顺序即翻页顺序。
+// home=时钟/天气/待办;calendar=真实月历+日程;ai=AI 用量;system=服务器+Agent 探活。
+export const PAGES = ["home", "calendar", "ai", "system"];
 
 const BLACK = "#000000";
 const WHITE = "#FFFFFF";
@@ -243,10 +242,8 @@ export function renderFrame({ page, version, deviceId, data, now = Date.now() })
 		renderCalendarPage(ctx, d, frameData.events);
 	} else if (page === "home") {
 		renderHomePage(ctx, d, frameData);
-	} else if (page === "servers") {
-		renderStatusPage(ctx, frameData.servers, t("服务器", "SERVERS"));
-	} else if (page === "agents") {
-		renderStatusPage(ctx, frameData.agents, t("智能体", "AGENTS"));
+	} else if (page === "system") {
+		renderSystemPage(ctx, frameData);
 	} else if (page === "ai") {
 		renderAiPage(ctx, frameData.aiUsage);
 	} else {
@@ -470,13 +467,15 @@ function renderPlaceholderPage(ctx, page) {
 	);
 }
 
-// ---- 服务器/Agent 页:探活列表(在线●+延迟 / 离线○) ----
-function renderStatusPage(ctx, probes, title) {
+// ---- System 页:服务器 + Agent 探活合并(在线●+延迟 / 离线○) ----
+function renderSystemPage(ctx, data) {
 	const M = 48;
-	drawText(ctx, title, M, 150, fontCss(88, { bold: true, cjk: true }));
-	drawHLine(ctx, 230, M, FRAME_WIDTH - M, 4);
+	drawText(ctx, t("系统状态", "SYSTEM"), M, 150, fontCss(80, { bold: true, cjk: true }));
+	drawHLine(ctx, 226, M, FRAME_WIDTH - M, 4);
 
-	if (!probes || !probes.length) {
+	const servers = data.servers ?? [];
+	const agents = data.agents ?? [];
+	if (!servers.length && !agents.length) {
 		drawCenteredText(
 			ctx,
 			t("未配置探活目标,请在 Admin 页添加", "NO TARGETS - ADD IN ADMIN"),
@@ -487,44 +486,39 @@ function renderStatusPage(ctx, probes, title) {
 		return;
 	}
 
-	const rowTop = 280;
-	const rowBottom = 1120;
-	const maxRows = 6;
-	const rowH = (rowBottom - rowTop) / maxRows;
-	probes.slice(0, maxRows).forEach((p, i) => {
-		const y = rowTop + i * rowH + rowH / 2;
-		// 状态圆点:实心=在线,空心=离线
-		ctx.beginPath();
-		ctx.arc(M + 30, y, 22, 0, Math.PI * 2);
-		if (p.up) {
-			ctx.fill();
-		} else {
-			ctx.lineWidth = 6;
-			ctx.stroke();
-		}
-		drawText(ctx, p.name, M + 90, y, fontCss(52, { bold: true, cjk: true }));
-		const status = p.up ? t(`在线 · ${p.ms}ms`, `UP · ${p.ms}ms`) : t("离线", "DOWN");
-		drawText(
-			ctx,
-			status,
-			FRAME_WIDTH - M,
-			y,
-			fontCss(44, { cjk: true }),
-			"right",
-		);
-		if (i < Math.min(probes.length, maxRows) - 1) {
-			drawHLine(ctx, rowTop + (i + 1) * rowH, M, FRAME_WIDTH - M, 2);
-		}
-	});
+	// 单节绘制:节标题 + 探活行(实心点在线/空心点离线)
+	function drawSection(title, probes, headY, maxRows) {
+		if (!probes.length) return headY;
+		drawText(ctx, title, M, headY, fontCss(44, { bold: true, cjk: true }));
+		const rowTop = headY + 44;
+		const rowH = Math.min(84, 260 / Math.max(1, maxRows));
+		probes.slice(0, maxRows).forEach((p, i) => {
+			const y = rowTop + i * rowH + rowH / 2;
+			ctx.beginPath();
+			ctx.arc(M + 22, y, 16, 0, Math.PI * 2);
+			if (p.up) {
+				ctx.fill();
+			} else {
+				ctx.lineWidth = 5;
+				ctx.stroke();
+			}
+			drawText(ctx, p.name, M + 70, y, fontCss(44, { bold: true, cjk: true }));
+			const status = p.up ? t(`在线 · ${p.ms}ms`, `UP · ${p.ms}ms`) : t(p.status ? `离线 (${p.status})` : "离线", p.status ? `DOWN (${p.status})` : "DOWN");
+			drawText(ctx, status, FRAME_WIDTH - M, y, fontCss(36, { cjk: true }), "right");
+		});
+		return rowTop + Math.min(probes.length, maxRows) * rowH;
+	}
 
-	const upCount = probes.filter((p) => p.up).length;
-	drawText(
-		ctx,
-		t(`${upCount} / ${probes.length} 在线`, `${upCount} / ${probes.length} UP`),
-		M,
-		1160,
-		fontCss(40, { cjk: true }),
-	);
+	const afterServers = drawSection(t("服务器", "SERVERS"), servers, 280, 5);
+	const afterAgents = drawSection(t("智能体", "AGENTS"), agents, afterServers + 40, 4);
+
+	const upServers = servers.filter((p) => p.up).length;
+	const upAgents = agents.filter((p) => p.up).length;
+	const summary = [
+		servers.length ? t(`服务器 ${upServers}/${servers.length} 在线`, `SERVERS ${upServers}/${servers.length} UP`) : null,
+		agents.length ? t(`智能体 ${upAgents}/${agents.length} 在线`, `AGENTS ${upAgents}/${agents.length} UP`) : null,
+	].filter(Boolean).join("　·　");
+	drawText(ctx, summary, M, 1160, fontCss(40, { cjk: true }));
 }
 
 // ---- AI 页:每源一行(标签+套餐 / 主百分比 / 条纹进度条 / 窗口明细) ----

@@ -103,7 +103,24 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // 信息屏常亮
 
-        frameDir = cacheDir
+        frameDir = File(filesDir, "frames")
+        // 迁移:0.2.0 及之前缓存在 cacheDir(低存储时可能被系统清理),
+        // 首次运行把旧帧搬到持久目录,避免升级后黑屏一次
+        val legacyDir = File(cacheDir, "frames")
+        if (legacyDir.isDirectory) {
+            legacyDir.listFiles()?.forEach { old ->
+                val target = File(frameDir, old.name)
+                if (!target.exists()) old.renameTo(target)
+            }
+            legacyDir.deleteRecursively()
+        }
+        // 兼容更早版本直接放在 cacheDir 根目录的 frame_current.png
+        File(cacheDir, "frame_current.png")?.takeIf { it.exists() }?.let {
+            val target = File(frameDir, "frame_home.png")
+            if (!target.exists()) it.renameTo(target)
+            it.delete()
+        }
+        frameDir.mkdirs()
 
         frameView = findViewById(R.id.frame_view)
         setupPanel = findViewById(R.id.setup_panel)
@@ -314,10 +331,10 @@ class MainActivity : Activity() {
         return try {
             val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
 
-            // 配置版本变化 → 应用刷新策略(轮询间隔/全刷阈值/全刷周期)
-            val configVersion = manifest.optInt("configVersion", 0)
-            if (configVersion != prefs.getInt(KEY_CONFIG_VERSION, -1)) {
-                prefs.edit().putInt(KEY_CONFIG_VERSION, configVersion).apply()
+            // 配置版本(内容 hash 字符串)变化 → 应用刷新策略(轮询间隔/全刷阈值/周期)
+            val configVersion = manifest.optString("configVersion", "")
+            if (configVersion != prefs.getString(KEY_CONFIG_VERSION, null)) {
+                prefs.edit().putString(KEY_CONFIG_VERSION, configVersion).apply()
                 manifest.optJSONObject("refresh")?.let { r ->
                     pollIntervalMs = r.optLong("pollSeconds", POLL_INTERVAL_MS / 1000)
                         .coerceIn(60, 3600) * 1000
@@ -366,7 +383,8 @@ class MainActivity : Activity() {
                 prefs.edit().putLong(KEY_LAST_FULL_SEQ, manifest.optLong("fullRefreshSeq", 0)).apply()
             }
 
-            // 按页差量下载:version 与本地记录一致才跳过,sha256 校验失败丢弃
+            // 按页差量下载:version 与本地记录一致才跳过,sha256 校验失败丢弃;
+            // 远程 Refresh 指令强制重拉当前页(即使 version 未变)
             val frameBase = manifest.optString("frameBaseUrl", "/api/device/frame")
             val pagesArr = manifest.optJSONArray("pages")
             var currentUpdated = false
@@ -377,7 +395,8 @@ class MainActivity : Activity() {
                     val version = p.optLong("version", -1L)
                     val sha = p.optString("sha256")
                     if (page.isBlank() || version < 0) continue
-                    if (version == lastVersion(prefs, page)) continue
+                    val forceReload = remoteRefresh && page == currentPage
+                    if (!forceReload && version == lastVersion(prefs, page)) continue
                     val url = "$currentServerUrl$frameBase/$page.png"
                     if (downloadFrame(page, url, version, sha)) {
                         setLastVersion(prefs, page, version)
@@ -393,14 +412,16 @@ class MainActivity : Activity() {
             // 心跳上报(失败不影响同步结果)
             postHeartbeat(prefs)
 
-            // 全刷策略:远程全刷 > 连续局刷达到阈值 > 周期到期(消残影)
+            // 全刷策略:远程全刷独立触发(即使画面无变化,消残影也是合法需求);
+            // 其余按 连续局刷阈值 / 周期到期
             val now = System.currentTimeMillis()
             val lastFull = prefs.getLong(KEY_LAST_FULL_AT, 0)
             val partialCount = prefs.getInt(KEY_PARTIAL_COUNT, 0)
-            val dueFull = currentUpdated && (
-                remoteFull ||
+            val dueFull = remoteFull || (
+                currentUpdated && (
                     partialCount + 1 >= forceFullAfter ||
-                    now - lastFull >= forceFullMinutes * 60_000L
+                        now - lastFull >= forceFullMinutes * 60_000L
+                    )
                 )
             if (currentUpdated) {
                 prefs.edit()

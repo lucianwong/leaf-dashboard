@@ -51,8 +51,7 @@
       <button data-page="home">HOME</button>
       <button data-page="calendar">CALENDAR</button>
       <button data-page="ai">AI</button>
-      <button data-page="servers">SERVERS</button>
-      <button data-page="agents">AGENTS</button>
+      <button data-page="system">SYSTEM</button>
     </p>
     <p>
       <button id="ctlRefresh">刷新</button>
@@ -226,11 +225,11 @@
         loadConfig();
       }
 
-      // 预览:直接引用 frame 接口,带时间戳避免缓存
+      // 预览:静态 frame 文件,带时间戳避免缓存
       function reloadPreview() {
         const page = document.getElementById("pageSel").value;
         const img = document.getElementById("preview");
-        img.src = "api/device/admin-preview/frame?page=" + page + "&t=" + Date.now();
+        img.src = "api/device/frame/" + encodeURIComponent(page) + ".png?t=" + Date.now();
       }
 
       async function initPages() {

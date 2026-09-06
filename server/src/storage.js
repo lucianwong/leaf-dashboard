@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { isSafePublicHttpUrl } from "./urlguard.js";
 
 const DATA_DIR = path.join(
@@ -175,10 +176,26 @@ export function getConfig() {
 	return { ...config };
 }
 
-// 配置版本:每次 updateConfig 递增,manifest.configVersion 据此让客户端感知刷新策略变化
-let configRev = 1;
+// 配置版本:设备相关配置的稳定内容 hash(进程重启不变、内容不变不变、
+// 内容变更自动变化)。todos 属内容数据不参与 hash,避免待办编辑触发
+// 客户端配置重应用。
+const CONFIG_HASH_KEYS = [
+	"pollIntervalSec",
+	"fullRefreshIntervalSec",
+	"weatherLat",
+	"weatherLon",
+	"icsUrl",
+	"aiUsage",
+	"servers",
+	"agents",
+];
 export function getConfigRev() {
-	return configRev;
+	const stable = {};
+	for (const key of CONFIG_HASH_KEYS) stable[key] = config[key];
+	return createHash("sha256")
+		.update(JSON.stringify(stable))
+		.digest("hex")
+		.slice(0, 8);
 }
 
 /** 更新配置:逐字段钳制校验,非法字段不报错只忽略,返回生效后的配置 */
@@ -214,7 +231,6 @@ export function updateConfig(patch) {
 	if ("servers" in patch) config.servers = sanitizeChecks(patch.servers);
 	if ("agents" in patch) config.agents = sanitizeChecks(patch.agents);
 	if ("todos" in patch) config.todos = sanitizeTodos(patch.todos);
-	configRev += 1;
 	atomicWrite(CONFIG_FILE, config);
 	return getConfig();
 }

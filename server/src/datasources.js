@@ -6,47 +6,91 @@
 //  - 天气用 Open-Meteo:免费、无需 API key,凭据零负担
 //  - 进程内 TTL 缓存 + 最近一次成功值兜底:外部源抖动时画面保持旧数据
 
+import dns from "node:dns";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { getConfig } from "./storage.js";
-import { isSafePublicHttpUrl } from "./urlguard.js";
+import { isSafePublicHttpUrl, isPrivateAddress } from "./urlguard.js";
 
 const FETCH_TIMEOUT_MS = 5_000;
 const CACHE_TTL_MS = 5 * 60_000;
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECTS = 3;
 
 /** @type {Map<string, {ts: number, data: any}>} */
 const cache = new Map();
 /** @type {Map<string, any>} 最近一次成功数据(源失败时兜底) */
 const lastGood = new Map();
 
-async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS, extraHeaders = {}) {
-	// 请求发起前就地校验(SSRF 防护,内联原语便于静态验证):
-	// 仅公网 http(s);拒绝 localhost/内网 IPv4 段/环回/链路本地/IPv6 本地/保留域
-	const u = new URL(url);
+/** 主机名文本层校验:拒绝 localhost/私网/环回/链路本地/保留段字面量与保留域 */
+function assertPublicHostname(hostname) {
+	if (
+		/(^|\.)(localhost|local|internal|ip6-localhost)$/i.test(hostname) ||
+		hostname === "::1" ||
+		hostname.startsWith("[::") ||
+		hostname.startsWith("fc") || hostname.startsWith("fd") || hostname.startsWith("fe80") ||
+		/^(127|10|0)\./.test(hostname) ||
+		/^169\.254\./.test(hostname) ||
+		/^192\.168\./.test(hostname) ||
+		/^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+		/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(hostname)
+	) {
+		throw new Error(`blocked host: ${hostname}`);
+	}
+}
+
+/**
+ * 解析 URL 并做完整 SSRF 校验:协议白名单 → 主机名文本校验 →
+ * DNS 解析全部 A/AAAA 记录逐个确认非私网(防 DNS rebinding)。
+ * @returns {Promise<URL>}
+ */
+async function resolveValidatedUrl(urlStr) {
+	const u = new URL(urlStr);
 	if (u.protocol !== "http:" && u.protocol !== "https:") {
 		throw new Error(`blocked protocol: ${u.protocol}`);
 	}
 	const host = u.hostname;
-	if (
-		/(^|\.)(localhost|local|internal|ip6-localhost)$/i.test(host) ||
-		host === "::1" ||
-		host.startsWith("[::") ||
-		host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80") ||
-		/^(127|10|0)\./.test(host) ||
-		/^169\.254\./.test(host) ||
-		/^192\.168\./.test(host) ||
-		/^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-		/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host)
-	) {
-		throw new Error(`blocked host: ${host}`);
+	if (!host) throw new Error("empty host");
+	assertPublicHostname(host);
+	// DNS 层:域名可能解析到内网(例如 169.254.169.254 云元数据),逐记录校验
+	const addrs = await dns.promises.lookup(host, { all: true });
+	for (const { address } of addrs) {
+		if (isPrivateAddress(address)) {
+			throw new Error(`blocked dns: ${host} -> ${address}`);
+		}
 	}
+	return u;
+}
+
+/** 单次请求(redirect: manual),由 fetchText 循环处理跳转并逐跳校验 */
+async function fetchOnce(u, timeoutMs, extraHeaders) {
 	const res = await fetch(u, {
+		redirect: "manual",
 		signal: AbortSignal.timeout(timeoutMs),
 		headers: { "User-Agent": "leaf5-dashboard/0.1", ...extraHeaders },
 	});
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	return res.text();
+	return res;
+}
+
+async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS, extraHeaders = {}) {
+	// 请求发起前就地校验;重定向逐跳重新解析+校验(防 302 跳内网)
+	let current = url;
+	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+		const u = await resolveValidatedUrl(current);
+		const res = await fetchOnce(u, timeoutMs, extraHeaders);
+		if (REDIRECT_STATUSES.has(res.status)) {
+			const location = res.headers.get("location");
+			if (!location) throw new Error(`redirect ${res.status} without location`);
+			res.body?.cancel?.();
+			current = new URL(location, u).toString();
+			continue;
+		}
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		return res.text();
+	}
+	throw new Error(`too many redirects (> ${MAX_REDIRECTS})`);
 }
 
 async function fetchJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -129,7 +173,8 @@ function parseIcs(text, horizonDays = 7) {
 
 	const events = [];
 	let cur = null;
-	const horizon = Date.now() + horizonDays * 86_400_000;
+	const now = Date.now();
+	const horizon = now + horizonDays * 86_400_000;
 	for (const line of lines) {
 		const idx = line.indexOf(":");
 		if (idx < 0) continue;
@@ -137,7 +182,14 @@ function parseIcs(text, horizonDays = 7) {
 		const val = line.slice(idx + 1).trim();
 		if (key === "BEGIN" && val === "VEVENT") cur = {};
 		else if (key === "END" && val === "VEVENT") {
-			if (cur?.start && cur.start.getTime() <= horizon && cur.summary) events.push(cur);
+			// 只收 [now, horizon] 内的事件:历史事件不允许出现在"近 7 天"
+			if (
+				cur?.start && cur.summary &&
+				cur.start.getTime() >= now &&
+				cur.start.getTime() <= horizon
+			) {
+				events.push(cur);
+			}
 			cur = null;
 		} else if (cur) {
 			if (key === "DTSTART") cur.start = icsDt(val);
@@ -160,13 +212,18 @@ export function fetchEvents() {
 // ---- 服务器 / Agent 探活 ----
 
 async function probeOne({ name, url }) {
-	if (!isSafePublicHttpUrl(url)) return { name, up: false, ms: null };
+	if (!isSafePublicHttpUrl(url)) return { name, up: false, ms: null, status: null };
 	const start = Date.now();
 	try {
-		await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-		return { name, up: true, ms: Date.now() - start };
+		// DNS 解析校验(防 rebinding);探活以 HTTP 成功状态(2xx)判定
+		const u = await resolveValidatedUrl(url);
+		const res = await fetch(u, {
+			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+			redirect: "manual",
+		});
+		return { name, up: res.ok, status: res.status, ms: Date.now() - start };
 	} catch {
-		return { name, up: false, ms: null };
+		return { name, up: false, ms: null, status: null };
 	}
 }
 
@@ -427,8 +484,12 @@ export function startBackgroundRefresh() {
 	refreshTimer.unref();
 }
 
-// 配置变更后尽快刷新快照(去抖 1s);否则新数据源要等最多 5 分钟才出画面
+// 配置变更后尽快刷新快照(去抖 1s);否则新数据源要等最多 5 分钟才出画面。
+// 同时清空 TTL 缓存与 lastGood:避免旧配置的数据串进新配置
+// (例:ICS 从 A 改到 B,B 拉取失败时不应继续显示 A 的日程)
 export function refreshSoon() {
+	cache.clear();
+	lastGood.clear();
 	clearTimeout(refreshSoonTimer);
 	refreshSoonTimer = setTimeout(() => {
 		refreshSnapshot().catch(() => {});

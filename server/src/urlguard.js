@@ -60,6 +60,18 @@ function isPrivateV6(host) {
 }
 
 /**
+ * 主机名/IP 是否为私网、环回、链路本地或保留地址(DNS rebinding 防护用:
+ * DNS 解析出的每个 A/AAAA 记录都要过这一关)。
+ * @param {string} host IP 字面量(IPv4/IPv6);域名请先经 isSafePublicHttpUrl 文本校验
+ * @returns {boolean}
+ */
+export function isPrivateAddress(host) {
+	if (net.isIPv4(host)) return isPrivateV4(host);
+	if (host.includes(":")) return isPrivateV6(host);
+	return false;
+}
+
+/**
  * 是否为可安全请求的公网 http(s) URL。
  * @param {string} raw
  * @returns {boolean}
