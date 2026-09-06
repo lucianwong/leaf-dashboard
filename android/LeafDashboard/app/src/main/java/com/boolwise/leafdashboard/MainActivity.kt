@@ -84,6 +84,8 @@ class MainActivity : Activity() {
     private var pollIntervalMs: Long = POLL_INTERVAL_MS
     // 本轮 sync 要求 full 刷新(消残影),有新帧贴图后在 UI 线程触发整刷
     private var pendingFullRefresh = false
+    // 待执行的远程全刷 seq:整刷真正触发后才 commit,失败下轮重试
+    private var pendingFullSeq = 0L
     // 连续局刷阈值(manifest.refresh.forceFullAfter),超过即触发全刷
     private var forceFullAfter = 12
     // 全刷周期(manifest.refresh.forceFullMinutes)
@@ -104,11 +106,14 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // 信息屏常亮
 
         frameDir = File(filesDir, "frames")
+        // 目标目录必须先于迁移创建(rename 跨目录依赖目标存在)
+        frameDir.mkdirs()
         // 迁移:0.2.0 及之前所有 frame 都写在 cacheDir 根(frame_current.png /
         // frame_<page>.png / 残留的 frame_next_*.png)。整目录搬到持久目录:
         //  - frame_current.png 语义上就是当前显示页,归位为 frame_home.png
         //  - frame_next_*.png 是下载中间态,直接丢弃
-        //  - 其余 frame_*.png 原名迁移;系统低存储清理 cacheDir 不再丢帧
+        //  - 其余 frame_*.png 原名迁移;只有 rename/copy 成功后才删除旧文件,
+        //    失败的旧文件保留,下次启动重试(系统低存储清理 cacheDir 不再丢帧)
         val legacyNames = mutableSetOf<File>()
         cacheDir.listFiles()?.forEach { old ->
             if (old.isFile && old.name.startsWith("frame_")) legacyNames.add(old)
@@ -127,11 +132,20 @@ class MainActivity : Activity() {
                 continue
             }
             val target = File(frameDir, targetName)
-            if (!target.exists()) old.renameTo(target)
-            old.delete()
+            if (target.exists()) {
+                old.delete()
+                continue
+            }
+            val moved = old.renameTo(target)
+            val copied = if (moved) true else try {
+                old.copyTo(target, overwrite = false) != null
+            } catch (e: Exception) {
+                false
+            }
+            if (moved || copied) old.delete()
         }
-        File(cacheDir, "frames")?.deleteRecursively()
-        frameDir.mkdirs()
+        // 仅当旧目录已空才移除(残留未迁移成功的文件下次启动重试)
+        File(cacheDir, "frames").takeIf { it.isDirectory && it.listFiles()?.isEmpty() == true }?.delete()
 
         frameView = findViewById(R.id.frame_view)
         setupPanel = findViewById(R.id.setup_panel)
@@ -292,6 +306,7 @@ class MainActivity : Activity() {
                         if (pendingFullRefresh) {
                             pendingFullRefresh = false
                             performEinkFullRefresh()
+                            commitFullSeq()
                         }
                     }
 
@@ -301,6 +316,7 @@ class MainActivity : Activity() {
                         if (pendingFullRefresh) {
                             pendingFullRefresh = false
                             performEinkFullRefresh()
+                            commitFullSeq()
                         }
                     }
 
@@ -344,6 +360,7 @@ class MainActivity : Activity() {
      */
     private fun checkAndUpdate(): RefreshResult {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        pendingFullSeq = 0L
         return try {
             val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
 
@@ -398,15 +415,14 @@ class MainActivity : Activity() {
                 }
             }
 
-            // 远程刷新/全刷信号:seq 推进即视为有指令
-            val remoteRefresh = manifest.optLong("refreshSeq", 0) > prefs.getLong(KEY_LAST_REFRESH_SEQ, 0)
-            val remoteFull = manifest.optLong("fullRefreshSeq", 0) > prefs.getLong(KEY_LAST_FULL_SEQ, 0)
-            if (remoteRefresh) {
-                prefs.edit().putLong(KEY_LAST_REFRESH_SEQ, manifest.optLong("refreshSeq", 0)).apply()
-            }
-            if (remoteFull) {
-                prefs.edit().putLong(KEY_LAST_FULL_SEQ, manifest.optLong("fullRefreshSeq", 0)).apply()
-            }
+            // 远程刷新/全刷信号:seq 推进即视为有指令。
+            // seq 不在此处持久化——必须等对应操作成功后才 commit,
+            // 否则下载失败会吞掉指令;失败时下一轮 manifest 的 seq 仍更大,自动重试
+            val remoteRefreshSeq = manifest.optLong("refreshSeq", 0)
+            val remoteFullSeq = manifest.optLong("fullRefreshSeq", 0)
+            val remoteRefresh = remoteRefreshSeq > prefs.getLong(KEY_LAST_REFRESH_SEQ, 0)
+            val remoteFull = remoteFullSeq > prefs.getLong(KEY_LAST_FULL_SEQ, 0)
+            pendingFullSeq = if (remoteFull) remoteFullSeq else 0L
 
             // 按页差量下载:version 与本地记录一致才跳过,sha256 校验失败丢弃;
             // 远程 Refresh 指令强制重拉当前页(即使 version 未变)
@@ -425,10 +441,17 @@ class MainActivity : Activity() {
                     val url = "$currentServerUrl$frameBase/$page.png"
                     if (downloadFrame(page, url, version, sha)) {
                         setLastVersion(prefs, page, version)
-                        if (page == currentPage) currentUpdated = true
+                        if (page == currentPage) {
+                            currentUpdated = true
+                            // 强制重拉的当前页已成功落地,刷新指令才算完成
+                            if (forceReload) {
+                                prefs.edit().putLong(KEY_LAST_REFRESH_SEQ, remoteRefreshSeq).apply()
+                            }
+                        }
                         Log.d(TAG, "sync page '$page' v$version done")
                     } else if (page == currentPage) {
                         // 当前页下载失败:保留旧画面,不更新版本号
+                        // (refreshSeq 也未 commit,下一轮自动重试)
                         return RefreshResult.Failed("download failed")
                     }
                 }
@@ -546,6 +569,17 @@ class MainActivity : Activity() {
         java.security.MessageDigest.getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    /** 远程全刷已真正触发,才固化其 seq(失败下轮重试) */
+    private fun commitFullSeq() {
+        if (pendingFullSeq > 0) {
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putLong(KEY_LAST_FULL_SEQ, pendingFullSeq)
+                .apply()
+            pendingFullSeq = 0L
+        }
+    }
 
     /**
      * 心跳上报:电量/充电/WiFi/当前页/各页版本/运行时长,

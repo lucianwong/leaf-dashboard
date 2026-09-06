@@ -76,7 +76,11 @@ async function fetchOnce(u, timeoutMs, extraHeaders) {
 
 async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS, extraHeaders = {}) {
 	// 请求发起前就地校验;重定向逐跳重新解析+校验(防 302 跳内网)。
-	// Authorization 不允许跨 origin 重定向(凭据不得泄露给其他站点)
+	// Authorization 不允许跨 origin 重定向(凭据不得泄露给其他站点);
+	// 头名匹配大小写无关(HTTP 头本就 case-insensitive)
+	const hasAuthHeader = Object.keys(extraHeaders).some(
+		(k) => k.toLowerCase() === "authorization",
+	);
 	let current = url;
 	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
 		const u = await resolveValidatedUrl(current);
@@ -89,7 +93,7 @@ async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS, extraHeaders = {}) {
 			const crossOrigin =
 				next.origin !== u.origin ||
 				next.protocol !== u.protocol;
-			if (crossOrigin && "Authorization" in extraHeaders) {
+			if (crossOrigin && hasAuthHeader) {
 				throw new Error(
 					`blocked cross-origin redirect with Authorization: ${u.origin} -> ${next.origin}`,
 				);
