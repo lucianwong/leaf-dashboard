@@ -104,22 +104,33 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // 信息屏常亮
 
         frameDir = File(filesDir, "frames")
-        // 迁移:0.2.0 及之前缓存在 cacheDir(低存储时可能被系统清理),
-        // 首次运行把旧帧搬到持久目录,避免升级后黑屏一次
-        val legacyDir = File(cacheDir, "frames")
-        if (legacyDir.isDirectory) {
-            legacyDir.listFiles()?.forEach { old ->
-                val target = File(frameDir, old.name)
-                if (!target.exists()) old.renameTo(target)
+        // 迁移:0.2.0 及之前所有 frame 都写在 cacheDir 根(frame_current.png /
+        // frame_<page>.png / 残留的 frame_next_*.png)。整目录搬到持久目录:
+        //  - frame_current.png 语义上就是当前显示页,归位为 frame_home.png
+        //  - frame_next_*.png 是下载中间态,直接丢弃
+        //  - 其余 frame_*.png 原名迁移;系统低存储清理 cacheDir 不再丢帧
+        val legacyNames = mutableSetOf<File>()
+        cacheDir.listFiles()?.forEach { old ->
+            if (old.isFile && old.name.startsWith("frame_")) legacyNames.add(old)
+        }
+        File(cacheDir, "frames").takeIf { it.isDirectory }?.listFiles()?.forEach { old ->
+            if (old.isFile) legacyNames.add(old)
+        }
+        for (old in legacyNames) {
+            val targetName = when {
+                old.name.startsWith("frame_next_") -> null // 中间态直接删
+                old.name == "frame_current.png" -> "frame_home.png"
+                else -> old.name
             }
-            legacyDir.deleteRecursively()
+            if (targetName == null) {
+                old.delete()
+                continue
+            }
+            val target = File(frameDir, targetName)
+            if (!target.exists()) old.renameTo(target)
+            old.delete()
         }
-        // 兼容更早版本直接放在 cacheDir 根目录的 frame_current.png
-        File(cacheDir, "frame_current.png")?.takeIf { it.exists() }?.let {
-            val target = File(frameDir, "frame_home.png")
-            if (!target.exists()) it.renameTo(target)
-            it.delete()
-        }
+        File(cacheDir, "frames")?.deleteRecursively()
         frameDir.mkdirs()
 
         frameView = findViewById(R.id.frame_view)
@@ -286,6 +297,11 @@ class MainActivity : Activity() {
 
                     is RefreshResult.Unchanged -> {
                         Log.d(TAG, "version ${result.version} unchanged, skip download")
+                        // 远程全刷/消残影到期即使画面无变化也要执行整刷
+                        if (pendingFullRefresh) {
+                            pendingFullRefresh = false
+                            performEinkFullRefresh()
+                        }
                     }
 
                     is RefreshResult.Failed -> {
@@ -332,8 +348,17 @@ class MainActivity : Activity() {
             val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
 
             // 配置版本(内容 hash 字符串)变化 → 应用刷新策略(轮询间隔/全刷阈值/周期)
+            // 升级迁移:0.2.0 曾以 Int 存储旧版递增计数,getString 会抛
+            // ClassCastException 导致同步永远失败——遇到即清除,按未配置处理
             val configVersion = manifest.optString("configVersion", "")
-            if (configVersion != prefs.getString(KEY_CONFIG_VERSION, null)) {
+            val storedConfigVersion = try {
+                prefs.getString(KEY_CONFIG_VERSION, null)
+            } catch (e: ClassCastException) {
+                prefs.edit().remove(KEY_CONFIG_VERSION).apply()
+                Log.i(TAG, "configVersion migrated Int -> String")
+                null
+            }
+            if (configVersion != storedConfigVersion) {
                 prefs.edit().putString(KEY_CONFIG_VERSION, configVersion).apply()
                 manifest.optJSONObject("refresh")?.let { r ->
                     pollIntervalMs = r.optLong("pollSeconds", POLL_INTERVAL_MS / 1000)
