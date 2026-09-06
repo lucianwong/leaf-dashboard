@@ -439,9 +439,9 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         pendingFullSeq = 0L
         return try {
-            val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
-            // M7 指标:同步尝试计数(成功/失败在收尾拆分)
+            // M7 指标:同步尝试计数(在发起请求前,失败也算一次 attempt)
             prefs.edit().putInt(KEY_SYNC_ATTEMPT, prefs.getInt(KEY_SYNC_ATTEMPT, 0) + 1).apply()
+            val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
 
             // 配置版本(内容 hash 字符串)变化 → 应用刷新策略(轮询间隔/全刷阈值/周期)
             // 升级迁移:0.2.0 曾以 Int 存储旧版递增计数,getString 会抛
@@ -487,7 +487,8 @@ class MainActivity : Activity() {
                     if (page in pages && page != currentPage) {
                         currentPage = page
                         prefs.edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
-                        showCachedFrame(currentPage)
+                        // 视图操作必须回 UI 线程(sync 在 IO executor 上执行)
+                        runOnUiThread { showCachedFrame(currentPage) }
                         Log.i(TAG, "remote page switch -> '$currentPage'")
                     }
                     prefs.edit().putLong(KEY_APPLIED_DESIRED_SEQ, seq).apply()
@@ -541,23 +542,17 @@ class MainActivity : Activity() {
 
             // 全刷策略:远程全刷独立触发(即使画面无变化,消残影也是合法需求);
             // 其余按 连续局刷阈值 / 周期到期。
+            // 局刷计数已在显示路径(performPartialRefresh)统一维护;
             // sinceFull/lastFullRefreshAt 只在整刷真正执行时更新(见 performEinkFullRefresh)
             val now = System.currentTimeMillis()
             val lastFull = prefs.getLong(KEY_LAST_FULL_AT, 0)
             val partialSinceFull = prefs.getInt(KEY_PARTIAL_SINCE_FULL, 0)
             val dueFull = remoteFull || (
                 currentUpdated && (
-                    partialSinceFull + 1 >= forceFullAfter ||
+                    partialSinceFull >= forceFullAfter ||
                         now - lastFull >= forceFullMinutes * 60_000L
                     )
                 )
-            if (currentUpdated && !dueFull) {
-                // 本次按 partial 展示:总数+1,距上次全刷计数+1
-                prefs.edit()
-                    .putInt(KEY_PARTIAL_TOTAL, prefs.getInt(KEY_PARTIAL_TOTAL, 0) + 1)
-                    .putInt(KEY_PARTIAL_SINCE_FULL, partialSinceFull + 1)
-                    .apply()
-            }
             pendingFullRefresh = dueFull
             val contentVersion = manifest.optLong("contentVersion", 0)
             // M7 指标:同步成功 → success 计数 + 清除 lastError
@@ -736,7 +731,7 @@ class MainActivity : Activity() {
                 .put("deviceModel", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
                 .put("lastSyncAt", prefs.getLong(KEY_LAST_SYNC_AT, 0))
                 .put("lastSyncStatus", prefs.getString(KEY_LAST_SYNC_STATUS, null) ?: "never")
-                .put("lastError", prefs.getString(KEY_LAST_ERROR, null))
+                .put("lastError", prefs.getString(KEY_LAST_ERROR, null) ?: JSONObject.NULL)
                 .put("frameCacheBytes", cacheBytes)
                 .put("syncAttemptCount", prefs.getInt(KEY_SYNC_ATTEMPT, 0))
                 .put("syncSuccessCount", prefs.getInt(KEY_SYNC_SUCCESS, 0))
@@ -777,17 +772,43 @@ class MainActivity : Activity() {
     }
 
     /** 展示指定页的本地缓存;无缓存(首装)则保持黑屏 */
-    private fun showCachedFrame(page: String) {
+    /**
+     * 展示本地缓存页。
+     * @param triggerPartial true=切页/普通展示,触发一次局部刷新;
+     *                       false=整刷回退恢复内容(display 与 refresh 解耦)
+     */
+    private fun showCachedFrame(
+        page: String,
+        triggerPartial: Boolean = true,
+    ) {
         val file = frameFile(page)
         if (!file.exists()) return
         val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return
-        showBitmap(bitmap)
+        showBitmap(bitmap, triggerPartial)
     }
 
-    private fun showBitmap(bitmap: Bitmap) {
+    /**
+     * 显示帧(默认触发一次局部刷新)。
+     * Full 回退恢复内容时用 triggerPartial=false——display 与 refresh 解耦,
+     * 整刷完成后的内容重绘不得再计一次 partial/覆盖 full 策略标记
+     */
+    private fun showBitmap(bitmap: Bitmap, triggerPartial: Boolean = true) {
         frameView.setImageBitmap(bitmap)
-        // M9:普通内容变化走 partial 刷新路径(BOOX 专有 API,Generic 为 invalidate)
-        prefs().edit().putString(KEY_LAST_REFRESH_STRATEGY, "partial").apply()
+        if (triggerPartial) {
+            performPartialRefresh()
+        }
+    }
+
+    /**
+     * Partial 刷新统一入口(M9):所有真正执行的局部刷新都从这里走,
+     * 计数(total/sinceFull)与策略标记在此集中维护
+     */
+    private fun performPartialRefresh() {
+        prefs().edit()
+            .putInt(KEY_PARTIAL_TOTAL, prefs().getInt(KEY_PARTIAL_TOTAL, 0) + 1)
+            .putInt(KEY_PARTIAL_SINCE_FULL, prefs().getInt(KEY_PARTIAL_SINCE_FULL, 0) + 1)
+            .putString(KEY_LAST_REFRESH_STRATEGY, "partial")
+            .apply()
         eink.partialRefresh(frameView)
     }
 
@@ -801,7 +822,11 @@ class MainActivity : Activity() {
             .putInt(KEY_PARTIAL_SINCE_FULL, 0)
             .putString(KEY_LAST_REFRESH_STRATEGY, "full")
             .apply()
-        eink.fullRefresh(frameView) { showCachedFrame(currentPage) }
+        // 回退恢复内容帧时不再触发 partial(display/refresh 解耦),
+        // 完成回调后才 commit 远程全刷 seq
+        eink.fullRefresh(frameView, { showCachedFrame(currentPage, triggerPartial = false) }) {
+            commitFullSeq()
+        }
     }
 
     /** 每页独立的 frame 缓存文件 */

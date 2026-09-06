@@ -23,7 +23,7 @@ class GenericEinkController : EinkController {
         view.postInvalidate()
     }
 
-    override fun fullRefresh(view: View, showFrame: () -> Unit) {
+    override fun fullRefresh(view: View, showFrame: () -> Unit, onComplete: () -> Unit) {
         Log.i(TAG, "eink full refresh (generic white-black-frame)")
         val imageView = view as? android.widget.ImageView
         val solid: (Int) -> android.graphics.Bitmap = { color ->
@@ -38,6 +38,8 @@ class GenericEinkController : EinkController {
             imageView?.setImageBitmap(solid(android.graphics.Color.BLACK))
             view.postDelayed({
                 showFrame()
+                // 内容帧贴出即完成(白→黑→内容三连的最后一步)
+                onComplete()
             }, FLASH_STEP_MS)
         }, FLASH_STEP_MS)
     }

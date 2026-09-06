@@ -38,13 +38,15 @@ class BooxEinkController(
         view.postInvalidate()
     }
 
-    override fun fullRefresh(view: View, showFrame: () -> Unit) {
+    override fun fullRefresh(view: View, showFrame: () -> Unit, onComplete: () -> Unit) {
         if (invokeAnyFullRefresh()) {
             Log.i(TAG, "eink full refresh via boox api")
+            // 专有 API 调用为同步语义,返回即完成
+            onComplete()
             return
         }
         Log.i(TAG, "boox api unavailable, falling back to generic full refresh")
-        fallback.fullRefresh(view, showFrame)
+        fallback.fullRefresh(view, showFrame, onComplete)
     }
 
     /** 反射尝试候选类中的整刷方法:任一命中返回 true */

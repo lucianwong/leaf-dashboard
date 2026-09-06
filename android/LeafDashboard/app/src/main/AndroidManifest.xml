@@ -16,7 +16,9 @@
         <receiver
             android:name=".boot.BootReceiver"
             android:enabled="true"
-            android:exported="true">
+            android:exported="false">
+            <!-- 仅接收系统受保护广播(BOOT_COMPLETED/MY_PACKAGE_REPLACED),
+                 无需暴露给其他应用,exported=false 更收紧 -->
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />

@@ -117,7 +117,8 @@ export function touchDevice(deviceId, { version, page, telemetry } = {}) {
 	if (version != null) rec.lastVersion = version;
 	if (page != null) rec.page = page;
 	if (telemetry) {
-		// Leaf Runtime 1.1 诊断/E-Ink 指标白名单
+		// Leaf Runtime 1.1 诊断/E-Ink 指标白名单。
+		// lastError 例外:显式 null 表示"同步成功清除旧错误",必须覆盖
 		for (const key of [
 			"appVersion",
 			"battery",
@@ -149,7 +150,8 @@ export function touchDevice(deviceId, { version, page, telemetry } = {}) {
 			"einkMode",
 			"lastRefreshStrategy",
 		]) {
-			if (telemetry[key] != null) rec[key] = telemetry[key];
+			const v = telemetry[key];
+			if (v != null || (key === "lastError" && v === null)) rec[key] = v;
 		}
 	}
 	devices.set(deviceId, rec);

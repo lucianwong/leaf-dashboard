@@ -29,8 +29,13 @@ interface EinkController {
     /** 局部刷新:普通内容变化/切页 */
     fun partialRefresh(view: View)
 
-    /** 整屏刷新:消残影;showFrame 用于回退方案最后重绘当前内容 */
-    fun fullRefresh(view: View, showFrame: () -> Unit)
+    /**
+     * 整屏刷新:消残影。
+     *  - showFrame:回退方案最后重绘当前内容(不得触发新的局部刷新)
+     *  - onComplete:整屏刷新真正完成(帧已全部贴出)后回调,
+     *    用于固化远程指令 seq;保证被调用且只被调用一次
+     */
+    fun fullRefresh(view: View, showFrame: () -> Unit, onComplete: () -> Unit)
 
     /** 设置刷新模式(专有 API 支持时生效) */
     fun setMode(mode: EinkMode) {}
