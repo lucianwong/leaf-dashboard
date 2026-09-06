@@ -52,20 +52,26 @@ class MainActivity : Activity() {
         private const val KEY_PAGES = "pages" // 服务端下发的页面清单(JSON 数组序列化)
         private const val KEY_CURRENT_PAGE = "current_page"
         private const val KEY_CONFIG_VERSION = "config_version" // manifest 配置版本
-        private const val KEY_PARTIAL_COUNT = "partial_count" // 连续局刷计数(消残影策略)
+        private const val KEY_PARTIAL_SINCE_FULL = "partial_count" // 距上次全刷的局刷计数(消残影策略)
         private const val KEY_LAST_FULL_AT = "last_full_at" // 上次全刷时刻(epoch ms)
         private const val KEY_LAST_REFRESH_SEQ = "last_refresh_seq" // 远程刷新信号
         private const val KEY_LAST_FULL_SEQ = "last_full_seq" // 远程全刷信号
         private const val KEY_APPLIED_DESIRED_SEQ = "applied_desired_seq" // 已应用的远程切页
         // Leaf Runtime 1.1:M7 稳定性指标 + M8 Crash Guard
         private const val KEY_RUNTIME_START = "runtime_start_at" // 本次进程启动时刻
+        private const val KEY_LAST_ALIVE_AT = "last_alive_at" // 最近存活心跳(healthy-run 判定)
         private const val KEY_CRASH_COUNT = "crash_count" // 疑似连续崩溃计数
         private const val KEY_SAFE_MODE = "safe_mode" // 安全模式(暂停同步只显缓存)
-        private const val KEY_SYNC_COUNT = "sync_count" // manifest 同步成功次数
+        private const val KEY_SAFE_MODE_UNTIL = "safe_mode_until" // 安全模式截止时刻(持久化恢复)
+        private const val KEY_STARTUP_REASON = "startup_reason" // boot/package_replaced/manual
+        private const val KEY_SYNC_ATTEMPT = "sync_attempt_count" // 同步尝试次数
+        private const val KEY_SYNC_SUCCESS = "sync_success_count" // 同步成功次数
         private const val KEY_SYNC_FAIL_COUNT = "sync_fail_count" // 同步失败次数
         private const val KEY_DL_COUNT = "frame_dl_count" // frame 下载成功次数
         private const val KEY_DL_FAIL_COUNT = "frame_dl_fail_count" // frame 下载失败次数
         private const val KEY_FULL_REFRESH_COUNT = "full_refresh_count" // 全刷执行次数
+        private const val KEY_PARTIAL_TOTAL = "partial_refresh_total" // 局刷总数
+        private const val KEY_LAST_REFRESH_STRATEGY = "last_refresh_strategy" // partial/full
         private const val KEY_LAST_ERROR = "last_error" // 最近一次错误摘要
         private const val KEY_LAST_SYNC_AT = "last_sync_at" // 最近同步时刻
         private const val KEY_LAST_SYNC_STATUS = "last_sync_status" // success/failed
@@ -178,25 +184,38 @@ class MainActivity : Activity() {
         currentPage = prefs.getString(KEY_CURRENT_PAGE, null)?.takeIf { it in pages }
             ?: pages.first()
 
-        // M8 Crash Guard:距上次进程启动不足 5 分钟 → 视为疑似崩溃(正常长期
-        // 常驻场景两次启动间隔远大于此);连续 ≥3 次进入 Safe Mode,
-        // 只显示本地缓存、暂停同步,进程稳定 5 分钟后自动恢复正常
+        // M8 Crash Guard(1.1 修订):healthy-run / startupReason 降低正常重启误判
+        //  - 上次会话存活 ≥5 分钟(healthy run)→ 重置崩溃计数(正常重启非崩溃)
+        //  - startupReason = boot / package_replaced → 系统性重启,重置计数
+        //  - 疑似崩溃 = 两次启动间隔 <5 分钟 且 上次会话非 healthy
+        // Safe Mode 用持久化 safeModeUntil(epoch)判定,不依赖单个 Handler
+        // callback——进程在截止前被杀再重启仍直接进入 heartbeat-only
         val now = System.currentTimeMillis()
         val lastStart = prefs.getLong(KEY_RUNTIME_START, 0)
-        val crashedRecently = lastStart > 0 && now - lastStart < 5 * 60_000L
+        val lastAlive = prefs.getLong(KEY_LAST_ALIVE_AT, 0)
+        val startupReason = prefs.getString(KEY_STARTUP_REASON, null)
+        prefs.edit().remove(KEY_STARTUP_REASON).apply()
+        val lastRunUptime = if (lastAlive > lastStart) lastAlive - lastStart else 0
+        val healthyRun = lastRunUptime >= 5 * 60_000L
+        val systemicRestart = startupReason == "boot" || startupReason == "package_replaced"
+        val crashedRecently = !systemicRestart && !healthyRun &&
+            lastStart > 0 && now - lastStart < 5 * 60_000L
         val crashCount = if (crashedRecently) prefs.getInt(KEY_CRASH_COUNT, 0) + 1 else 0
         safeMode = crashCount >= 3
+        val safeModeUntil = if (safeMode) now + 5 * 60_000L else 0
         prefs.edit()
             .putLong(KEY_RUNTIME_START, now)
             .putInt(KEY_CRASH_COUNT, crashCount)
             .putBoolean(KEY_SAFE_MODE, safeMode)
+            .putLong(KEY_SAFE_MODE_UNTIL, safeModeUntil)
             .apply()
         if (safeMode) {
-            Log.w(TAG, "entering safe mode (crashCount=$crashCount)")
+            Log.w(TAG, "entering safe mode (crashCount=$crashCount, until=$safeModeUntil)")
             Toast.makeText(this, "连续异常,进入安全模式(仅显示缓存)", Toast.LENGTH_LONG).show()
         }
         if (crashedRecently || safeMode) {
-            Log.i(TAG, "start: crashedRecently=$crashedRecently crashCount=$crashCount safeMode=$safeMode")
+            Log.i(TAG, "start: reason=$startupReason crashedRecently=$crashedRecently " +
+                "crashCount=$crashCount safeMode=$safeMode lastRunUptime=$lastRunUptime")
         }
 
         findViewById<Button>(R.id.btn_save).setOnClickListener { onSaveClicked() }
@@ -212,22 +231,11 @@ class MainActivity : Activity() {
             urlInput.setText(currentServerUrl)
             setupPanel.visibility = View.VISIBLE
         } else {
-            // 启动原则:先显示本地缓存,不等网络
+            // 启动原则:先显示本地缓存,不等网络。
+            // Safe Mode 进入/退出由持久化 safeModeUntil 判定(pollOnce 内
+            // heartbeat-only),不依赖单个 Handler callback
             showCachedFrame(currentPage)
-            if (safeMode) {
-                // Safe Mode:暂停同步;进程稳定 5 分钟自动退出恢复轮询
-                handler.postDelayed({
-                    Log.i(TAG, "safe mode stable 5min, resuming normal sync")
-                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                        .putBoolean(KEY_SAFE_MODE, false)
-                        .putInt(KEY_CRASH_COUNT, 0)
-                        .apply()
-                    safeMode = false
-                    if (!isFinishing && !isDestroyed) pollOnce()
-                }, 5 * 60_000L)
-            } else {
-                scheduleNextPoll()
-            }
+            scheduleNextPoll()
         }
     }
 
@@ -335,9 +343,17 @@ class MainActivity : Activity() {
      * 才弹 Toast 反馈;自动轮询/翻页触发的拉取完全静默,不遮挡画面
      */
     private fun pollOnce(manual: Boolean = false) {
-        // Safe Mode:暂停一切同步,只保留本地画面与最小心跳
-        if (safeMode) {
-            Log.d(TAG, "safe mode, skip sync")
+        // Safe Mode:safeModeUntil 截止前为 heartbeat-only(设备保持在线可见,
+        // Admin 可看到 safeMode 标记);截止后本函数自动恢复正常同步
+        if (isSafeModeActive()) {
+            Log.d(TAG, "safe mode, heartbeat-only sync")
+            ioExecutor.execute {
+                if (isFinishing || isDestroyed) return@execute
+                val p = prefs()
+                p.edit().putLong(KEY_LAST_ALIVE_AT, System.currentTimeMillis()).apply()
+                postHeartbeat(p)
+            }
+            scheduleNextPoll()
             return
         }
         // 防抖:已有刷新在进行中(下载/请求未返回)时,重复触屏或重复点按钮直接忽略
@@ -424,8 +440,8 @@ class MainActivity : Activity() {
         pendingFullSeq = 0L
         return try {
             val manifest = httpGetJson("$currentServerUrl/api/device/${deviceId(prefs)}/manifest")
-            // M7 指标:同步成功计数
-            prefs.edit().putInt(KEY_SYNC_COUNT, prefs.getInt(KEY_SYNC_COUNT, 0) + 1).apply()
+            // M7 指标:同步尝试计数(成功/失败在收尾拆分)
+            prefs.edit().putInt(KEY_SYNC_ATTEMPT, prefs.getInt(KEY_SYNC_ATTEMPT, 0) + 1).apply()
 
             // 配置版本(内容 hash 字符串)变化 → 应用刷新策略(轮询间隔/全刷阈值/周期)
             // 升级迁移:0.2.0 曾以 Int 存储旧版递增计数,getString 会抛
@@ -520,32 +536,37 @@ class MainActivity : Activity() {
                 }
             }
 
-            // 心跳上报(失败不影响同步结果)
-            postHeartbeat(prefs)
+            // 心跳上报移至 finally:在全部 metrics 更新之后执行,
+            // 且下载失败等提前返回路径也照常上报
 
             // 全刷策略:远程全刷独立触发(即使画面无变化,消残影也是合法需求);
-            // 其余按 连续局刷阈值 / 周期到期
+            // 其余按 连续局刷阈值 / 周期到期。
+            // sinceFull/lastFullRefreshAt 只在整刷真正执行时更新(见 performEinkFullRefresh)
             val now = System.currentTimeMillis()
             val lastFull = prefs.getLong(KEY_LAST_FULL_AT, 0)
-            val partialCount = prefs.getInt(KEY_PARTIAL_COUNT, 0)
+            val partialSinceFull = prefs.getInt(KEY_PARTIAL_SINCE_FULL, 0)
             val dueFull = remoteFull || (
                 currentUpdated && (
-                    partialCount + 1 >= forceFullAfter ||
+                    partialSinceFull + 1 >= forceFullAfter ||
                         now - lastFull >= forceFullMinutes * 60_000L
                     )
                 )
-            if (currentUpdated) {
+            if (currentUpdated && !dueFull) {
+                // 本次按 partial 展示:总数+1,距上次全刷计数+1
                 prefs.edit()
-                    .putInt(KEY_PARTIAL_COUNT, if (dueFull) 0 else partialCount + 1)
-                    .putLong(KEY_LAST_FULL_AT, if (dueFull) now else lastFull)
+                    .putInt(KEY_PARTIAL_TOTAL, prefs.getInt(KEY_PARTIAL_TOTAL, 0) + 1)
+                    .putInt(KEY_PARTIAL_SINCE_FULL, partialSinceFull + 1)
                     .apply()
             }
             pendingFullRefresh = dueFull
             val contentVersion = manifest.optLong("contentVersion", 0)
-            // M7 指标:同步成功收尾
+            // M7 指标:同步成功 → success 计数 + 清除 lastError
             prefs.edit()
+                .putInt(KEY_SYNC_SUCCESS, prefs.getInt(KEY_SYNC_SUCCESS, 0) + 1)
                 .putLong(KEY_LAST_SYNC_AT, System.currentTimeMillis())
                 .putString(KEY_LAST_SYNC_STATUS, "success")
+                .putString(KEY_LAST_ERROR, null)
+                .putLong(KEY_LAST_ALIVE_AT, System.currentTimeMillis())
                 .apply()
             if (currentUpdated) RefreshResult.Updated(contentVersion) else RefreshResult.Unchanged(0)
         } catch (e: Exception) {
@@ -556,8 +577,12 @@ class MainActivity : Activity() {
                 .putLong(KEY_LAST_SYNC_AT, System.currentTimeMillis())
                 .putString(KEY_LAST_SYNC_STATUS, "failed")
                 .putString(KEY_LAST_ERROR, reason)
+                .putLong(KEY_LAST_ALIVE_AT, System.currentTimeMillis())
                 .apply()
             RefreshResult.Failed(reason)
+        } finally {
+            // 心跳在全部 metrics 更新之后上报;失败路径也照常上报
+            postHeartbeat(prefs)
         }
     }
 
@@ -695,6 +720,8 @@ class MainActivity : Activity() {
                 }
             }
             frameDir.listFiles()?.forEach { if (it.isFile) cacheBytes += it.length() }
+            // 存活心跳(healthy-run 判定依据)
+            prefs.edit().putLong(KEY_LAST_ALIVE_AT, System.currentTimeMillis()).apply()
 
             val body = JSONObject()
                 .put("appVersion", BuildConfig.VERSION_NAME)
@@ -711,16 +738,22 @@ class MainActivity : Activity() {
                 .put("lastSyncStatus", prefs.getString(KEY_LAST_SYNC_STATUS, null) ?: "never")
                 .put("lastError", prefs.getString(KEY_LAST_ERROR, null))
                 .put("frameCacheBytes", cacheBytes)
-                .put("syncCount", prefs.getInt(KEY_SYNC_COUNT, 0))
+                .put("syncAttemptCount", prefs.getInt(KEY_SYNC_ATTEMPT, 0))
+                .put("syncSuccessCount", prefs.getInt(KEY_SYNC_SUCCESS, 0))
                 .put("syncFailCount", prefs.getInt(KEY_SYNC_FAIL_COUNT, 0))
                 .put("frameDownloadCount", prefs.getInt(KEY_DL_COUNT, 0))
                 .put("frameDownloadFailCount", prefs.getInt(KEY_DL_FAIL_COUNT, 0))
-                .put("partialRefreshCount", prefs.getInt(KEY_PARTIAL_COUNT, 0))
+                .put("partialRefreshTotal", prefs.getInt(KEY_PARTIAL_TOTAL, 0))
+                .put("partialSinceFull", prefs.getInt(KEY_PARTIAL_SINCE_FULL, 0))
                 .put("fullRefreshCount", prefs.getInt(KEY_FULL_REFRESH_COUNT, 0))
                 .put("lastFullRefreshAt", prefs.getLong(KEY_LAST_FULL_AT, 0))
+                .put("lastRefreshStrategy", prefs.getString(KEY_LAST_REFRESH_STRATEGY, null) ?: "none")
                 .put("crashCount", prefs.getInt(KEY_CRASH_COUNT, 0))
                 .put("safeMode", safeMode)
+                .put("safeModeUntil", prefs.getLong(KEY_SAFE_MODE_UNTIL, 0))
                 .put("einkController", eink.name)
+                .put("einkAvailable", eink.isAvailable())
+                .put("einkMode", "normal")
             httpPostJson("$currentServerUrl/api/device/${deviceId(prefs)}/heartbeat", body)
         } catch (e: Exception) {
             Log.d(TAG, "heartbeat failed: ${e.message}")
@@ -753,12 +786,21 @@ class MainActivity : Activity() {
 
     private fun showBitmap(bitmap: Bitmap) {
         frameView.setImageBitmap(bitmap)
+        // M9:普通内容变化走 partial 刷新路径(BOOX 专有 API,Generic 为 invalidate)
+        prefs().edit().putString(KEY_LAST_REFRESH_STRATEGY, "partial").apply()
+        eink.partialRefresh(frameView)
     }
 
     /** E-Ink 整屏刷新(M9):走 EinkController(BOOX 优先,Generic 白黑帧兜底) */
     private fun performEinkFullRefresh() {
         Log.i(TAG, "eink full refresh requested via ${eink.name}")
-        prefs().edit().putInt(KEY_FULL_REFRESH_COUNT, prefs().getInt(KEY_FULL_REFRESH_COUNT, 0) + 1).apply()
+        // 全刷真正执行:计数/时刻/距上次全刷计数都在此刻更新
+        prefs().edit()
+            .putInt(KEY_FULL_REFRESH_COUNT, prefs().getInt(KEY_FULL_REFRESH_COUNT, 0) + 1)
+            .putLong(KEY_LAST_FULL_AT, System.currentTimeMillis())
+            .putInt(KEY_PARTIAL_SINCE_FULL, 0)
+            .putString(KEY_LAST_REFRESH_STRATEGY, "full")
+            .apply()
         eink.fullRefresh(frameView) { showCachedFrame(currentPage) }
     }
 
@@ -766,6 +808,26 @@ class MainActivity : Activity() {
     private fun frameFile(page: String): File = File(frameDir, "frame_$page.png")
 
     private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
+
+    /**
+     * Safe Mode 活跃判定:以持久化 safeModeUntil(epoch)为准,
+     * 进程死亡重启后依然生效;截止后自动清除并恢复正常同步。
+     */
+    private fun isSafeModeActive(): Boolean {
+        val prefs = prefs()
+        if (!prefs.getBoolean(KEY_SAFE_MODE, false)) return false
+        if (System.currentTimeMillis() >= prefs.getLong(KEY_SAFE_MODE_UNTIL, 0)) {
+            Log.i(TAG, "safe mode expired, resuming normal sync")
+            prefs.edit()
+                .putBoolean(KEY_SAFE_MODE, false)
+                .putInt(KEY_CRASH_COUNT, 0)
+                .apply()
+            safeMode = false
+            return false
+        }
+        safeMode = true
+        return true
+    }
 
     private fun lastVersion(
         prefs: android.content.SharedPreferences,
@@ -796,7 +858,12 @@ class MainActivity : Activity() {
             val idx = (pages.indexOf(currentPage) + delta).mod(pages.size)
             currentPage = pages[idx]
             getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
+                .edit()
+                .putString(KEY_CURRENT_PAGE, currentPage)
+                // 切页也是一次局部刷新(计划 5.3)
+                .putInt(KEY_PARTIAL_TOTAL, prefs().getInt(KEY_PARTIAL_TOTAL, 0) + 1)
+                .putInt(KEY_PARTIAL_SINCE_FULL, prefs().getInt(KEY_PARTIAL_SINCE_FULL, 0) + 1)
+                .apply()
             showCachedFrame(currentPage)
             Log.i(TAG, "switch to page '$currentPage'")
         }

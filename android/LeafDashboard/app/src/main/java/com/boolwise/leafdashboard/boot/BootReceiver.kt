@@ -22,10 +22,15 @@ class BootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
-        if (action != Intent.ACTION_BOOT_COMPLETED && action != Intent.ACTION_MY_PACKAGE_REPLACED) {
-            return
+        val reason = when (action) {
+            Intent.ACTION_BOOT_COMPLETED -> "boot"
+            Intent.ACTION_MY_PACKAGE_REPLACED -> "package_replaced"
+            else -> return
         }
         Log.i(TAG, "boot event: $action, launching dashboard")
+        // 记录启动原因:系统性重启不计入 Crash Guard 的崩溃循环
+        context.getSharedPreferences("leaf_dashboard", Context.MODE_PRIVATE)
+            .edit().putString("startup_reason", reason).apply()
         val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
         if (launch != null) {
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
