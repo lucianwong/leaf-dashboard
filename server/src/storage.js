@@ -45,7 +45,7 @@ export const DEFAULT_CONFIG = {
 
 /** @type {Map<string, object>} deviceId -> 设备记录 */
 const devices = new Map();
-let config = { ...DEFAULT_CONFIG };
+const config = { ...DEFAULT_CONFIG };
 
 function atomicWrite(file, data) {
 	fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -68,7 +68,12 @@ export function initStore() {
 	}
 	// 配置字段做下限钳制,防止手改 JSON 出极端值(60s~1h)
 	const saved = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_FILE, {}) };
-	config.pollIntervalSec = clampInt(saved.pollIntervalSec, 60, 3600, DEFAULT_CONFIG.pollIntervalSec);
+	config.pollIntervalSec = clampInt(
+		saved.pollIntervalSec,
+		60,
+		3600,
+		DEFAULT_CONFIG.pollIntervalSec,
+	);
 	config.fullRefreshIntervalSec = clampInt(
 		saved.fullRefreshIntervalSec,
 		5 * 60,
@@ -76,12 +81,17 @@ export function initStore() {
 		DEFAULT_CONFIG.fullRefreshIntervalSec,
 	);
 	// 数据源字段同走 sanitize,保证从文件读入的结构可靠
-	config.weatherLat = Number.isFinite(Number(saved.weatherLat)) ? Number(saved.weatherLat) : DEFAULT_CONFIG.weatherLat;
-	config.weatherLon = Number.isFinite(Number(saved.weatherLon)) ? Number(saved.weatherLon) : DEFAULT_CONFIG.weatherLon;
+	config.weatherLat = Number.isFinite(Number(saved.weatherLat))
+		? Number(saved.weatherLat)
+		: DEFAULT_CONFIG.weatherLat;
+	config.weatherLon = Number.isFinite(Number(saved.weatherLon))
+		? Number(saved.weatherLon)
+		: DEFAULT_CONFIG.weatherLon;
 	config.icsUrl = typeof saved.icsUrl === "string" ? saved.icsUrl : "";
 	// 旧版单端点字段迁移:aiUsageUrl -> custom 源(未配置 aiUsage 时一次性迁移)
 	config.aiUsage = sanitizeAiUsage(
-		saved.aiUsage ?? (saved.aiUsageUrl ? [{ name: "custom", url: saved.aiUsageUrl }] : []),
+		saved.aiUsage ??
+			(saved.aiUsageUrl ? [{ name: "custom", url: saved.aiUsageUrl }] : []),
 	);
 	config.servers = sanitizeChecks(saved.servers);
 	config.agents = sanitizeChecks(saved.agents);
@@ -149,6 +159,7 @@ export function touchDevice(deviceId, { version, page, telemetry } = {}) {
 			"einkController",
 			"einkAvailable",
 			"einkMode",
+			"capabilities",
 			"lastRefreshStrategy",
 		]) {
 			const v = telemetry[key];
@@ -235,7 +246,12 @@ export function getConfigRev() {
 /** 更新配置:逐字段钳制校验,非法字段不报错只忽略,返回生效后的配置 */
 export function updateConfig(patch) {
 	if ("pollIntervalSec" in patch) {
-		config.pollIntervalSec = clampInt(patch.pollIntervalSec, 60, 3600, config.pollIntervalSec);
+		config.pollIntervalSec = clampInt(
+			patch.pollIntervalSec,
+			60,
+			3600,
+			config.pollIntervalSec,
+		);
 	}
 	if ("fullRefreshIntervalSec" in patch) {
 		config.fullRefreshIntervalSec = clampInt(
@@ -289,7 +305,9 @@ function sanitizeAiUsage(raw) {
 	const seen = new Set();
 	return raw
 		.map((it) => ({
-			name: String(it?.name ?? "").trim().toLowerCase(),
+			name: String(it?.name ?? "")
+				.trim()
+				.toLowerCase(),
 			url: String(it?.url ?? "").trim(),
 		}))
 		.filter((it) => {

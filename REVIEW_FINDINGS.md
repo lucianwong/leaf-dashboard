@@ -1,5 +1,61 @@
 # Review Findings — 2026-09-05 — android/LeafDashboard(全部源码 + 构建复跑)
 
+## M3 审查(2026-09-05)—— BOOX SDK 接入(git diff HEAD:onyxsdk-device 1.3.5.2 + OnyxEinkController + 模式映射)
+
+**结论:不通过(存在 P1×4,无 P0),修复量小(均为定点改动),修复后免复审,建议 PM 抽查即可。** 构建独立复跑 `clean assembleDebug --no-daemon --rerun-tasks` 38 任务 BUILD SUCCESSFUL(M3 diff 零警告,2 条警告均为 MainActivity 既有代码);SDK aar 已本地反编译验证核心行为,五项审查重点逐项结论如下。审查方法说明:反射链路结论来自对 gradle 缓存中 `onyxsdk-device-1.3.5.2.aar` 的 javap 字节码分析,非猜测。
+
+### 五项重点逐项结论
+
+1. **反射探测异常安全(PM 重点 1)—— 基本达标,一处防御缺口**
+   - OnyxEinkController companion 的 `Class.forName` 用 `catch (t: Throwable)` ✓(覆盖 NoClassDefFoundError/ExceptionInInitializerError 等 Error);partialRefresh/fullRefresh 的调用也是 `catch (t: Throwable)` ✓。
+   - 残留缺口:EinkControllerFactory.kt:31 仍是 `catch (e: Exception)`——经字节码路径推演当前不可穿透(CLASS_AVAILABLE 已拦掉类加载 Error;真正触发 EpdController/Device 类初始化的调用点都在 Throwable catch 内),但防御一致性建议改为 `catch (t: Throwable)`(P2-1)。
+2. **非 BOOX 设备影响(PM 重点 2)—— 不崩溃,但全刷静默失效(见 P1-1)**
+   - 字节码证据:BaseDevice.invalidate(view, mode) = `view.invalidate()`;BaseDevice.refreshScreen(view, mode) = **空方法(no-op)**;Device.detectDevice() 按 Build.HARDWARE/ro.board.platform 匹配(rk3288/rk312x/rk3368/msm8953/sdm660/bengal/msmnile/lito/volcano/freescale/imx7/rk30board),不命中 → `new BaseDevice()`。
+   - 即非 BOOX 设备上:局刷退化为标准 view.invalidate()(画面正常重绘,不坏);**全刷为 no-op 且不抛异常**——OnyxEinkController 的"调用不抛异常"探活判据对该场景完全失效,degrade 永不触发,Generic 白黑闪兜底永远轮不到,消残影静默消失且零日志零遥测。
+3. **http maven 供应链(PM 重点 3)—— allowInsecureProtocol 范围合规,CI 暴露面真实(见 P1-4)**
+   - allowInsecureProtocol 仅出现在 app/build.gradle.kts 的 BOOX 仓库声明,未全局放开 ✓;依赖版本固定 1.3.5.2 ✓。
+   - 但 ci.yml:64 在 GitHub Actions(公网)上 `./gradlew assembleDebug` 经 http 明文拉取该 aar,无校验和固定 → MITM/DNS 劫持可投毒,恶意代码直接进 APK 分发到设备。
+4. **invalidate/refreshScreen 线程要求(PM 重点 4)—— 主线程要求成立,当前全部调用点合规**
+   - 局刷链 EpdController.invalidate → BaseDevice.invalidate → `view.invalidate()`,View.invalidate 要求创建线程(主线程);全刷子类实现走 EPD 服务但约定同。当前接入点全部主线程:pollOnce 的 `runOnUiThread` 回调、Command `device.full_refresh` 的 `runOnUiThread { performEinkFullRefresh }`、switchPage/showCachedFrame(UI 回调)✓ 无违规。建议在 OnyxEinkController KDoc 固化"必须主线程"约定(P2-3)。
+5. **refresh 策略接入 vs 0.5.x Command/safe-mode(PM 重点 5)—— 执行链路完好,能力协商脱节(见 P1-3)**
+   - safe-mode heartbeat-only 分支不触碰任何 eink 方法 ✓;Command 幂等/台账/ACK 逻辑未动,device.full_refresh 的 `performEinkFullRefresh(0L)` 经 onyx 成功路径同步 onComplete(metrics 固化 + fullRefreshInFlight 复位恰好一次;catch 后 generic fallback 复用同一 onComplete,不重复)✓;page.switch/device.refresh/sync.restart 线程切换正确 ✓。
+   - 脱节点:能力协商字段与 Onyx 控制器未接上 + server 白名单丢字段,详见 P1-3。
+
+### P0 阻塞问题
+
+(无)
+
+### P1 应修复(M3 范围)
+
+1. **[OnyxEinkController.kt:46-56 探活判据 / SDK BaseDevice.refreshScreen no-op] 全刷静默失效:非 BOOX 设备及平台字符串不匹配的设备上 GC 全刷不执行、不报错、遥测恒报 true**
+   - 反编译实链:detectDevice() 不命中平台 → BaseDevice → refreshScreen 为空方法 → `EpdController.refreshScreen(view, GC)` 返回成功 → onComplete() 照常回调 → metrics 记 full 完成、`onyxFullAvailable=true`。Generic 白黑闪兜底与 degrade 路径永远不触发。Leaf5+ 为高通平台,其 `ro.board.platform` 字符串是否在 SDK 列表内未经真机确认——若不在,M3"真全刷"目标在目标机型上静默落空。
+   - 建议:探活改为能力探测——选中 onyx 前检查 `Device.currentDeviceIndex()`/`Device.currentDevice().javaClass.simpleName` 是否为已知设备类(反射读静态字段即可),BaseDevice 视为不可用直接走 Generic;真机 M0 用 Discovery 日志(`adb logcat -s LeafKeys` 已有机制)确认 detectDevice 命中类后再把 GC 路径视为已验证。
+2. **[onyxsdk-device aar manifest → merged APK] 权限膨胀:带入 CHANGE_WIFI_STATE/BLUETOOTH/DUMP 三个无用权限**
+   - 实测 `aapt2 dump permissions`:APK 现含 INTERNET/ACCESS_NETWORK_STATE/RECEIVE_BOOT_COMPLETED(项目自有,合理)+ **CHANGE_WIFI_STATE、BLUETOOTH、DUMP**(SDK 带入;aar manifest 明文声明,DUMP 为 signature 级保护权限)。违背 M0 确立的权限最小化基线,审计/上架均会被质疑。
+   - 建议:manifest 已有 tools 命名空间,三行 `tools:node="remove"` 逐个移除即可。
+3. **[MainActivity.kt:923-925 + server/src/index.js:296-346] capabilities 协商与新控制器脱节**
+   - 两处断链:① `eink-native-v1` 仅在 `booxFullAvailable==true` 时上报,而选中 OnyxEinkController 后 BooxEinkController 从未构造——onyx GC 真实可用时 eink-native-v1 永远缺失,服务端/Command 路由无法据此选择专有刷新;② Android 心跳上报的 `capabilities` 数组(含 onyxPartial/FullAvailable)不在 server 心跳白名单字段内,被静默丢弃,Admin 无从感知。
+   - 建议:① 判定改为 `booxFullAvailable || onyxFullAvailable`;② server 白名单增加 capabilities 字段(或 Android 侧改用既有布尔字段表达)。
+4. **[ci.yml:64 + app/build.gradle.kts:66-69] CI 公网经 http 明文拉取构建依赖,无校验和固定(供应链)**
+   - 仓库无 `gradle/verification-metadata.xml`;GitHub Actions 上 MITM/DNS 劫持可向构建注入恶意 aar 并随 APK 分发到设备。本机构建(固定版本 + Surge 代理)风险较低,CI 是主要暴露面。
+   - 建议(二选一):① `./gradlew --write-verification-metadata sha256` 生成 verification-metadata.xml 入库,CI 自动校验;② 更彻底:vendor 化——把 onyxsdk-device-1.3.5.2.aar(~200KB)提交进仓库 `app/libs/` 用 `files(...)` 引入,删除 http 仓库声明与 allowInsecureProtocol,供应链面归零(SDK 无版本升级诉求时最推荐)。
+
+### P2 建议
+
+1. **[EinkControllerFactory.kt:31] `catch (e: Exception)` → `catch (t: Throwable)`**:与两级控制器探活的 Throwable 风格对齐,杜绝 Error 类穿透显示链路的可能(当前推演不可穿透,纯防御)。
+2. **[settings.gradle.kts:11-13] 注释与 PREFER_PROJECT 语义相反**:注释称"未命中的依赖仍回退到 settings 里的镜像",实际 PREFER_PROJECT 下 settings 仓库被忽略——目前其他依赖能解析靠的是 app 模块补的 aliyun 镜像(行为正确,注释误导),建议改写注释避免后人误删镜像声明。
+3. **[OnyxEinkController.kt] KDoc 固化"必须主线程调用"约定**:invalidate 链含 view.invalidate()(主线程要求),当前调用点全部合规,加注释防止后续误用。
+4. **[传递依赖知晓项]** 依赖树实测 onyxsdk-device 带入 fastjson2(2.0.48.android8)与 kotlin-stdlib 1.8(升至 1.9.24);SDK 硬依赖无法避免,APK 增量与序列化库攻击面记入台账即可;`android.useAndroidX=true` 仅为 androidx.annotation 打开,注释已说明 ✓。
+5. **[tools:replace="android:allowBackup"]** 用途正当(SDK manifest allowBackup=true 与项目 false 冲突)✓,修复 P1-2 时保留即可。
+
+### 正面确认
+
+- 模式映射(partial→GU / full→GC)与任务书一致,UpdateMode 枚举实测存在 GU/GC ✓
+- degrade 单向降级 + fallback 包装,局刷对非 BOOX 设备等效标准重绘(不会坏画面)✓
+- `tools:replace`/`tools:remove` 命名空间引入规范;versionName 0.5.2 递进 ✓
+- 心跳 einkController/einkAvailable 字段为既有白名单,onyx 选中后如实上报 "onyx" ✓
+- M3 diff 零编译警告;既有 MainActivity 两条警告(186/612)不属本 diff,留待后续清理
+
 ## 终审(2026-09-05)—— android/ P1 修复复核 + 根 README 抽查
 
 **最终结论:通过,无需再审。** 两处 P1 修复正确落实,根 README 与实际一致,未发现新引入问题;`clean assembleDebug --no-daemon --rerun-tasks` 全量 38 任务复跑 BUILD SUCCESSFUL(exit=0,0 警告,APK 2,353,412 字节)。

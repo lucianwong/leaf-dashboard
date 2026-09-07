@@ -920,7 +920,10 @@ class MainActivity : Activity() {
             for ((cap, ok) in eink.capabilities) {
                 if (ok) capabilities.put(cap)
             }
-            if (eink.capabilities["booxFullAvailable"] == true) {
+            if (
+                eink.capabilities["booxFullAvailable"] == true ||
+                eink.capabilities["onyxFullAvailable"] == true
+            ) {
                 capabilities.put("eink-native-v1")
             }
 

@@ -308,6 +308,9 @@ app.post("/api/device/:deviceId/heartbeat", express.json(), (req, res) => {
 	// Leaf Runtime 1.1 诊断/E-Ink 指标:逐字段类型校验后透传给 storage 白名单
 	const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
 	const str = (v) => (typeof v === "string" ? v : null);
+	// capabilities:字符串数组(如 eink-native-v1),元素字符串化并限制数量防膨胀
+	const strArr = (v) =>
+		Array.isArray(v) ? v.map((x) => String(x)).slice(0, 32) : null;
 	touchDevice(deviceId, {
 		page: currentPage,
 		telemetry: {
@@ -341,6 +344,7 @@ app.post("/api/device/:deviceId/heartbeat", express.json(), (req, res) => {
 			einkAvailable:
 				typeof body.einkAvailable === "boolean" ? body.einkAvailable : null,
 			einkMode: str(body.einkMode),
+			capabilities: strArr(body.capabilities),
 			lastRefreshStrategy: str(body.lastRefreshStrategy),
 		},
 	});

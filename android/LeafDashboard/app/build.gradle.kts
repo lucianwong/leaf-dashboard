@@ -34,7 +34,7 @@ android {
         minSdk = 28
         targetSdk = 34
         versionCode = buildNumber + 100 // 保留人工干预空间,基线 100 起
-        versionName = "0.5.1"
+        versionName = "0.5.3"
 
         // 默认 Dashboard 服务端地址(可被首启动设置里保存的 URL 覆盖)。
         // 换部署环境时改这里,或在 App 首启动界面输入新地址。
@@ -58,7 +58,19 @@ android {
     }
 }
 
-// 零外部依赖:只用平台 API(HttpURLConnection / org.json / android.widget),
-// 减小 APK、减少依赖面,契合 E-Ink 常驻信息屏的极简定位
+// 仓库:onyx SDK 已 vendor 化(app/libs,供应链面归零,无 http 仓库声明);
+// PREFER_PROJECT 模式下项目仓库完全取代 settings 仓库(全局 init script 会 clear
+// settings 仓库),故保留 aliyun 镜像兜底其余运行时依赖(kotlin-stdlib/fastjson2 等)
+repositories {
+    maven { url = uri("https://maven.aliyun.com/repository/google") }
+    maven { url = uri("https://maven.aliyun.com/repository/public") }
+}
+
+// 依赖策略:平台 API 为主;唯一三方依赖是 BOOX 官方 E-Ink SDK(M3 真局刷/全刷),
+// 本地 vendor 化引入(供应链安全:不经 http 仓库拉取);其他业务逻辑仍坚持零依赖
+// 注:files() 引入 aar 的 POM 传递依赖不生效,fastjson2/androidx.annotation 需显式声明
 dependencies {
+    implementation(files("libs/onyxsdk-device-1.3.5.2.aar"))
+    implementation("com.alibaba.fastjson2:fastjson2:2.0.48.android8")
+    implementation("androidx.annotation:annotation:1.0.0")
 }
