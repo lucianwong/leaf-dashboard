@@ -18,10 +18,10 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Toast
-import org.json.JSONObject
 import com.boolwise.leafdashboard.command.CommandLedger
 import com.boolwise.leafdashboard.eink.EinkController
 import com.boolwise.leafdashboard.eink.EinkControllerFactory
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -58,6 +58,7 @@ class MainActivity : Activity() {
         private const val KEY_LAST_REFRESH_SEQ = "last_refresh_seq" // 远程刷新信号
         private const val KEY_LAST_FULL_SEQ = "last_full_seq" // 远程全刷信号
         private const val KEY_APPLIED_DESIRED_SEQ = "applied_desired_seq" // 已应用的远程切页
+
         // Leaf Runtime 1.1:M7 稳定性指标 + M8 Crash Guard
         private const val KEY_RUNTIME_START = "runtime_start_at" // 本次进程启动时刻
         private const val KEY_LAST_ALIVE_AT = "last_alive_at" // 最近存活心跳(healthy-run 判定)
@@ -103,18 +104,25 @@ class MainActivity : Activity() {
 
     // 轮询间隔由服务端 manifest 下发统一控制(钳制 1~60 分钟),默认 5 分钟
     private var pollIntervalMs: Long = POLL_INTERVAL_MS
+
     // 本轮 sync 要求 full 刷新(消残影),有新帧贴图后在 UI 线程触发整刷
     private var pendingFullRefresh = false
+
     // 待执行的远程全刷 seq:整刷真正触发后才 commit,失败下轮重试
     private var pendingFullSeq = 0L
+
     // E-Ink 控制器(BOOX 优先,Generic 兜底)
     private lateinit var eink: EinkController
+
     // Generic Full 的白→黑→内容约 300ms 异步窗口:期间忽略用户翻页/手动刷新
     private val fullRefreshInFlight = AtomicBoolean(false)
+
     // Safe Mode(M8):连续崩溃后暂停同步只显缓存,进程稳定 5 分钟自动退出
     private var safeMode = false
+
     // 连续局刷阈值(manifest.refresh.forceFullAfter),超过即触发全刷
     private var forceFullAfter = 12
+
     // 全刷周期(manifest.refresh.forceFullMinutes)
     private var forceFullMinutes = 45
 
@@ -151,11 +159,15 @@ class MainActivity : Activity() {
             if (old.isFile) legacyNames.add(old)
         }
         for (old in legacyNames) {
-            val targetName = when {
-                old.name.startsWith("frame_next_") -> null // 中间态直接删
-                old.name == "frame_current.png" -> "frame_home.png"
-                else -> old.name
-            }
+            val targetName =
+                when {
+                    old.name.startsWith("frame_next_") -> null
+
+                    // 中间态直接删
+                    old.name == "frame_current.png" -> "frame_home.png"
+
+                    else -> old.name
+                }
             if (targetName == null) {
                 old.delete()
                 continue
@@ -166,11 +178,16 @@ class MainActivity : Activity() {
                 continue
             }
             val moved = old.renameTo(target)
-            val copied = if (moved) true else try {
-                old.copyTo(target, overwrite = false) != null
-            } catch (e: Exception) {
-                false
-            }
+            val copied =
+                if (moved) {
+                    true
+                } else {
+                    try {
+                        old.copyTo(target, overwrite = false) != null
+                    } catch (e: Exception) {
+                        false
+                    }
+                }
             if (moved || copied) old.delete()
         }
         // 仅当旧目录已空才移除(残留未迁移成功的文件下次启动重试)
@@ -203,12 +220,14 @@ class MainActivity : Activity() {
         val lastRunUptime = if (lastAlive > lastStart) lastAlive - lastStart else 0
         val healthyRun = lastRunUptime >= 5 * 60_000L
         val systemicRestart = startupReason == "boot" || startupReason == "package_replaced"
-        val crashedRecently = !systemicRestart && !healthyRun &&
-            lastStart > 0 && now - lastStart < 5 * 60_000L
+        val crashedRecently =
+            !systemicRestart && !healthyRun &&
+                lastStart > 0 && now - lastStart < 5 * 60_000L
         val crashCount = if (crashedRecently) prefs.getInt(KEY_CRASH_COUNT, 0) + 1 else 0
         safeMode = crashCount >= 3
         val safeModeUntil = if (safeMode) now + 5 * 60_000L else 0
-        prefs.edit()
+        prefs
+            .edit()
             .putLong(KEY_RUNTIME_START, now)
             .putInt(KEY_CRASH_COUNT, crashCount)
             .putBoolean(KEY_SAFE_MODE, safeMode)
@@ -219,8 +238,11 @@ class MainActivity : Activity() {
             Toast.makeText(this, "连续异常,进入安全模式(仅显示缓存)", Toast.LENGTH_LONG).show()
         }
         if (crashedRecently || safeMode) {
-            Log.i(TAG, "start: reason=$startupReason crashedRecently=$crashedRecently " +
-                "crashCount=$crashCount safeMode=$safeMode lastRunUptime=$lastRunUptime")
+            Log.i(
+                TAG,
+                "start: reason=$startupReason crashedRecently=$crashedRecently " +
+                    "crashCount=$crashCount safeMode=$safeMode lastRunUptime=$lastRunUptime",
+            )
         }
 
         findViewById<Button>(R.id.btn_save).setOnClickListener { onSaveClicked() }
@@ -464,28 +486,34 @@ class MainActivity : Activity() {
             // 升级迁移:0.2.0 曾以 Int 存储旧版递增计数,getString 会抛
             // ClassCastException 导致同步永远失败——遇到即清除,按未配置处理
             val configVersion = manifest.optString("configVersion", "")
-            val storedConfigVersion = try {
-                prefs.getString(KEY_CONFIG_VERSION, null)
-            } catch (e: ClassCastException) {
-                prefs.edit().remove(KEY_CONFIG_VERSION).apply()
-                Log.i(TAG, "configVersion migrated Int -> String")
-                null
-            }
+            val storedConfigVersion =
+                try {
+                    prefs.getString(KEY_CONFIG_VERSION, null)
+                } catch (e: ClassCastException) {
+                    prefs.edit().remove(KEY_CONFIG_VERSION).apply()
+                    Log.i(TAG, "configVersion migrated Int -> String")
+                    null
+                }
             if (configVersion != storedConfigVersion) {
                 prefs.edit().putString(KEY_CONFIG_VERSION, configVersion).apply()
                 manifest.optJSONObject("refresh")?.let { r ->
-                    pollIntervalMs = r.optLong("pollSeconds", POLL_INTERVAL_MS / 1000)
+                    pollIntervalMs = r
+                        .optLong("pollSeconds", POLL_INTERVAL_MS / 1000)
                         .coerceIn(60, 3600) * 1000
                     forceFullAfter = r.optInt("forceFullAfter", 12)
                     forceFullMinutes = r.optInt("forceFullMinutes", 45)
                 }
-                Log.i(TAG, "config v$configVersion applied (poll=${pollIntervalMs / 1000}s fullAfter=$forceFullAfter fullMin=$forceFullMinutes)")
+                Log.i(
+                    TAG,
+                    "config v$configVersion applied (poll=${pollIntervalMs / 1000}s fullAfter=$forceFullAfter fullMin=$forceFullMinutes)",
+                )
             }
 
             // 页面清单以服务端为准;当前页不在清单里时回退首页
             manifest.optJSONArray("pages")?.let { arr ->
-                val list = (0 until arr.length())
-                    .mapNotNull { arr.optJSONObject(it)?.optString("id")?.takeIf(String::isNotBlank) }
+                val list =
+                    (0 until arr.length())
+                        .mapNotNull { arr.optJSONObject(it)?.optString("id")?.takeIf(String::isNotBlank) }
                 if (list.isNotEmpty()) {
                     pages = list
                     prefs.edit().putString(KEY_PAGES, list.joinToString(",")).apply()
@@ -570,10 +598,11 @@ class MainActivity : Activity() {
             val now = System.currentTimeMillis()
             val lastFull = prefs.getLong(KEY_LAST_FULL_AT, 0)
             val partialSinceFull = prefs.getInt(KEY_PARTIAL_SINCE_FULL, 0)
-            val dueFull = remoteFull || (
-                currentUpdated && (
-                    partialSinceFull >= forceFullAfter ||
-                        now - lastFull >= forceFullMinutes * 60_000L
+            val dueFull =
+                remoteFull || (
+                    currentUpdated && (
+                        partialSinceFull >= forceFullAfter ||
+                            now - lastFull >= forceFullMinutes * 60_000L
                     )
                 )
             pendingFullRefresh = dueFull
@@ -583,7 +612,8 @@ class MainActivity : Activity() {
             processCommands(manifest.optJSONArray("commands"), pagesArr, frameBase, prefs)
 
             // M7 指标:同步成功 → success 计数 + 清除 lastError
-            prefs.edit()
+            prefs
+                .edit()
                 .putInt(KEY_SYNC_SUCCESS, prefs.getInt(KEY_SYNC_SUCCESS, 0) + 1)
                 .putLong(KEY_LAST_SYNC_AT, System.currentTimeMillis())
                 .putString(KEY_LAST_SYNC_STATUS, "success")
@@ -594,7 +624,8 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             // M7 指标:同步失败计数 + 错误摘要
             val reason = describeError(e)
-            prefs.edit()
+            prefs
+                .edit()
                 .putInt(KEY_SYNC_FAIL_COUNT, prefs.getInt(KEY_SYNC_FAIL_COUNT, 0) + 1)
                 .putLong(KEY_LAST_SYNC_AT, System.currentTimeMillis())
                 .putString(KEY_LAST_SYNC_STATUS, "failed")
@@ -840,7 +871,8 @@ class MainActivity : Activity() {
         reason: String,
     ): Boolean {
         lastDlReason = reason
-        prefs.edit()
+        prefs
+            .edit()
             .putInt(KEY_DL_FAIL_COUNT, prefs.getInt(KEY_DL_FAIL_COUNT, 0) + 1)
             .putString(KEY_LAST_ERROR, reason)
             .apply()
@@ -849,7 +881,8 @@ class MainActivity : Activity() {
 
     /** 字节数组的 SHA-256 十六进制串(小写) */
     private fun sha256Hex(bytes: ByteArray): String =
-        java.security.MessageDigest.getInstance("SHA-256")
+        java.security.MessageDigest
+            .getInstance("SHA-256")
             .digest(bytes)
             .joinToString("") { "%02x".format(it) }
 
@@ -862,8 +895,9 @@ class MainActivity : Activity() {
             val bm = getSystemService(BATTERY_SERVICE) as android.os.BatteryManager
             val battery = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
             val chargeStatus = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_STATUS)
-            val charging = chargeStatus == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
-                chargeStatus == android.os.BatteryManager.BATTERY_STATUS_FULL
+            val charging =
+                chargeStatus == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                    chargeStatus == android.os.BatteryManager.BATTERY_STATUS_FULL
             val cm = getSystemService(CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
             val caps = cm.getNetworkCapabilities(cm.activeNetwork)
             val wifi = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
@@ -890,39 +924,40 @@ class MainActivity : Activity() {
                 capabilities.put("eink-native-v1")
             }
 
-            val body = JSONObject()
-                .put("appVersion", BuildConfig.VERSION_NAME)
-                .put("buildCommit", BuildConfig.BUILD_COMMIT)
-                .put("battery", battery)
-                .put("charging", charging)
-                .put("wifi", wifi)
-                .put("currentPage", currentPage)
-                .put("pageVersions", pageVersions)
-                .put("uptime", android.os.SystemClock.elapsedRealtime() / 1000)
-                // Leaf Runtime 1.1:M7/M9 诊断与 E-Ink 指标
-                .put("androidVersion", android.os.Build.VERSION.RELEASE)
-                .put("deviceModel", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
-                .put("lastSyncAt", prefs.getLong(KEY_LAST_SYNC_AT, 0))
-                .put("lastSyncStatus", prefs.getString(KEY_LAST_SYNC_STATUS, null) ?: "never")
-                .put("lastError", prefs.getString(KEY_LAST_ERROR, null) ?: JSONObject.NULL)
-                .put("frameCacheBytes", cacheBytes)
-                .put("syncAttemptCount", prefs.getInt(KEY_SYNC_ATTEMPT, 0))
-                .put("syncSuccessCount", prefs.getInt(KEY_SYNC_SUCCESS, 0))
-                .put("syncFailCount", prefs.getInt(KEY_SYNC_FAIL_COUNT, 0))
-                .put("frameDownloadCount", prefs.getInt(KEY_DL_COUNT, 0))
-                .put("frameDownloadFailCount", prefs.getInt(KEY_DL_FAIL_COUNT, 0))
-                .put("partialRefreshTotal", prefs.getInt(KEY_PARTIAL_TOTAL, 0))
-                .put("partialSinceFull", prefs.getInt(KEY_PARTIAL_SINCE_FULL, 0))
-                .put("fullRefreshCount", prefs.getInt(KEY_FULL_REFRESH_COUNT, 0))
-                .put("lastFullRefreshAt", prefs.getLong(KEY_LAST_FULL_AT, 0))
-                .put("lastRefreshStrategy", prefs.getString(KEY_LAST_REFRESH_STRATEGY, null) ?: "none")
-                .put("crashCount", prefs.getInt(KEY_CRASH_COUNT, 0))
-                .put("safeMode", safeMode)
-                .put("safeModeUntil", prefs.getLong(KEY_SAFE_MODE_UNTIL, 0))
-                .put("einkController", eink.name)
-                .put("einkAvailable", eink.isAvailable())
-                .put("einkMode", "normal")
-                .put("capabilities", capabilities)
+            val body =
+                JSONObject()
+                    .put("appVersion", BuildConfig.VERSION_NAME)
+                    .put("buildCommit", BuildConfig.BUILD_COMMIT)
+                    .put("battery", battery)
+                    .put("charging", charging)
+                    .put("wifi", wifi)
+                    .put("currentPage", currentPage)
+                    .put("pageVersions", pageVersions)
+                    .put("uptime", android.os.SystemClock.elapsedRealtime() / 1000)
+                    // Leaf Runtime 1.1:M7/M9 诊断与 E-Ink 指标
+                    .put("androidVersion", android.os.Build.VERSION.RELEASE)
+                    .put("deviceModel", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+                    .put("lastSyncAt", prefs.getLong(KEY_LAST_SYNC_AT, 0))
+                    .put("lastSyncStatus", prefs.getString(KEY_LAST_SYNC_STATUS, null) ?: "never")
+                    .put("lastError", prefs.getString(KEY_LAST_ERROR, null) ?: JSONObject.NULL)
+                    .put("frameCacheBytes", cacheBytes)
+                    .put("syncAttemptCount", prefs.getInt(KEY_SYNC_ATTEMPT, 0))
+                    .put("syncSuccessCount", prefs.getInt(KEY_SYNC_SUCCESS, 0))
+                    .put("syncFailCount", prefs.getInt(KEY_SYNC_FAIL_COUNT, 0))
+                    .put("frameDownloadCount", prefs.getInt(KEY_DL_COUNT, 0))
+                    .put("frameDownloadFailCount", prefs.getInt(KEY_DL_FAIL_COUNT, 0))
+                    .put("partialRefreshTotal", prefs.getInt(KEY_PARTIAL_TOTAL, 0))
+                    .put("partialSinceFull", prefs.getInt(KEY_PARTIAL_SINCE_FULL, 0))
+                    .put("fullRefreshCount", prefs.getInt(KEY_FULL_REFRESH_COUNT, 0))
+                    .put("lastFullRefreshAt", prefs.getLong(KEY_LAST_FULL_AT, 0))
+                    .put("lastRefreshStrategy", prefs.getString(KEY_LAST_REFRESH_STRATEGY, null) ?: "none")
+                    .put("crashCount", prefs.getInt(KEY_CRASH_COUNT, 0))
+                    .put("safeMode", safeMode)
+                    .put("safeModeUntil", prefs.getLong(KEY_SAFE_MODE_UNTIL, 0))
+                    .put("einkController", eink.name)
+                    .put("einkAvailable", eink.isAvailable())
+                    .put("einkMode", "normal")
+                    .put("capabilities", capabilities)
             httpPostJson("$currentServerUrl/api/device/${deviceId(prefs)}/heartbeat", body)
         } catch (e: Exception) {
             Log.d(TAG, "heartbeat failed: ${e.message}")
@@ -930,7 +965,10 @@ class MainActivity : Activity() {
     }
 
     /** POST JSON(心跳用);非 2xx 抛异常 */
-    private fun httpPostJson(url: String, body: JSONObject) {
+    private fun httpPostJson(
+        url: String,
+        body: JSONObject,
+    ) {
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
         conn.connectTimeout = CONNECT_TIMEOUT_MS
@@ -946,6 +984,7 @@ class MainActivity : Activity() {
     }
 
     /** 展示指定页的本地缓存;无缓存(首装)则保持黑屏 */
+
     /**
      * 展示本地缓存页。
      * @param triggerPartial true=切页/普通展示,触发一次局部刷新;
@@ -966,7 +1005,10 @@ class MainActivity : Activity() {
      * Full 回退恢复内容时用 triggerPartial=false——display 与 refresh 解耦,
      * 整刷完成后的内容重绘不得再计一次 partial/覆盖 full 策略标记
      */
-    private fun showBitmap(bitmap: Bitmap, triggerPartial: Boolean = true) {
+    private fun showBitmap(
+        bitmap: Bitmap,
+        triggerPartial: Boolean = true,
+    ) {
         frameView.setImageBitmap(bitmap)
         if (triggerPartial) {
             performPartialRefresh()
@@ -978,7 +1020,8 @@ class MainActivity : Activity() {
      * 计数(total/sinceFull)与策略标记在此集中维护
      */
     private fun performPartialRefresh() {
-        prefs().edit()
+        prefs()
+            .edit()
             .putInt(KEY_PARTIAL_TOTAL, prefs().getInt(KEY_PARTIAL_TOTAL, 0) + 1)
             .putInt(KEY_PARTIAL_SINCE_FULL, prefs().getInt(KEY_PARTIAL_SINCE_FULL, 0) + 1)
             .putString(KEY_LAST_REFRESH_STRATEGY, "partial")
@@ -1005,7 +1048,8 @@ class MainActivity : Activity() {
             frameView,
             { showCachedFrame(currentPage, triggerPartial = false) },
         ) {
-            prefs().edit()
+            prefs()
+                .edit()
                 .putInt(KEY_FULL_REFRESH_COUNT, prefs().getInt(KEY_FULL_REFRESH_COUNT, 0) + 1)
                 .putLong(KEY_LAST_FULL_AT, System.currentTimeMillis())
                 .putInt(KEY_PARTIAL_SINCE_FULL, 0)
@@ -1034,7 +1078,8 @@ class MainActivity : Activity() {
         if (!prefs.getBoolean(KEY_SAFE_MODE, false)) return false
         if (System.currentTimeMillis() >= prefs.getLong(KEY_SAFE_MODE_UNTIL, 0)) {
             Log.i(TAG, "safe mode expired, resuming normal sync")
-            prefs.edit()
+            prefs
+                .edit()
                 .putBoolean(KEY_SAFE_MODE, false)
                 .putInt(KEY_CRASH_COUNT, 0)
                 .apply()
@@ -1048,17 +1093,18 @@ class MainActivity : Activity() {
     private fun lastVersion(
         prefs: android.content.SharedPreferences,
         page: String,
-    ): Long = try {
-        prefs.getLong(KEY_LAST_VERSION_PREFIX + page, -1L)
-    } catch (e: ClassCastException) {
-        // 升级迁移:0.2.0 及之前以 Int 存储分钟版本号,新版本域为
-        // sha256 前缀 Long(可达 2^32-1)。读即迁移,旧值保留为 Long——
-        // 与新版本域数值不重叠,首 轮 sync 会自然比对出新帧并重下
-        val legacy = prefs.getInt(KEY_LAST_VERSION_PREFIX + page, -1)
-        prefs.edit().putLong(KEY_LAST_VERSION_PREFIX + page, legacy.toLong()).apply()
-        Log.i(TAG, "lastVersion '$page' migrated Int -> Long ($legacy)")
-        legacy.toLong()
-    }
+    ): Long =
+        try {
+            prefs.getLong(KEY_LAST_VERSION_PREFIX + page, -1L)
+        } catch (e: ClassCastException) {
+            // 升级迁移:0.2.0 及之前以 Int 存储分钟版本号,新版本域为
+            // sha256 前缀 Long(可达 2^32-1)。读即迁移,旧值保留为 Long——
+            // 与新版本域数值不重叠,首 轮 sync 会自然比对出新帧并重下
+            val legacy = prefs.getInt(KEY_LAST_VERSION_PREFIX + page, -1)
+            prefs.edit().putLong(KEY_LAST_VERSION_PREFIX + page, legacy.toLong()).apply()
+            Log.i(TAG, "lastVersion '$page' migrated Int -> Long ($legacy)")
+            legacy.toLong()
+        }
 
     private fun setLastVersion(
         prefs: android.content.SharedPreferences,
@@ -1070,8 +1116,13 @@ class MainActivity : Activity() {
 
     /** 读取持久化的页面清单,空/损坏时回退单页 home */
     private fun loadPages(prefs: android.content.SharedPreferences): List<String> {
-        val saved = prefs.getString(KEY_PAGES, null)?.split(",")?.map(String::trim)
-            ?.filter(String::isNotEmpty).orEmpty()
+        val saved =
+            prefs
+                .getString(KEY_PAGES, null)
+                ?.split(",")
+                ?.map(String::trim)
+                ?.filter(String::isNotEmpty)
+                .orEmpty()
         return if (saved.isEmpty()) listOf(DEFAULT_PAGE) else saved
     }
 
@@ -1089,7 +1140,9 @@ class MainActivity : Activity() {
             val idx = (pages.indexOf(currentPage) + delta).mod(pages.size)
             currentPage = pages[idx]
             getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit().putString(KEY_CURRENT_PAGE, currentPage).apply()
+                .edit()
+                .putString(KEY_CURRENT_PAGE, currentPage)
+                .apply()
             // 局刷计数由 showCachedFrame → performPartialRefresh 统一维护
             showCachedFrame(currentPage)
             Log.i(TAG, "switch to page '$currentPage'")
@@ -1146,10 +1199,11 @@ class MainActivity : Activity() {
         return super.onTouchEvent(event)
     }
 
-    // 已确认可翻页的键码:标准 PAGE_UP/PAGE_DOWN 与 DPAD 左右(部分 ROM 把翻页键
-    // 映射成这两组;BOOX 实际 KeyCode 真机采集后如有出入再补)
-    private val pageUpKeys = intArrayOf(92, 21) // KEYCODE_PAGE_UP, KEYCODE_DPAD_LEFT
-    private val pageDownKeys = intArrayOf(93, 22) // KEYCODE_PAGE_DOWN, KEYCODE_DPAD_RIGHT
+    // 已确认可翻页的键码:标准 PAGE_UP/PAGE_DOWN 与 DPAD 左右,以及 24/25
+    // (BOOX Leaf5+ 实机:翻页键发音量键码;系统 MediaSessionService 会消费未拦截的
+    // 音量键,必须在 onKeyDown 拦截消费 return true 才能切页,实机验证)
+    private val pageUpKeys = intArrayOf(92, 21, 24) // KEYCODE_PAGE_UP, KEYCODE_DPAD_LEFT, KEYCODE_VOLUME_UP
+    private val pageDownKeys = intArrayOf(93, 22, 25) // KEYCODE_PAGE_DOWN, KEYCODE_DPAD_RIGHT, KEYCODE_VOLUME_DOWN
 
     /** 实体翻页键切页(全部按键仍先在 LeafKeys tag 记录,便于真机采集) */
     override fun onKeyDown(
@@ -1176,6 +1230,11 @@ class MainActivity : Activity() {
         event: KeyEvent?,
     ): Boolean {
         Log.d(TAG_KEY_LOG, "onKeyUp keyCode=$keyCode action=${event?.action}")
+        // 翻页键(含 24/25 音量键码)在 keyDown 已消费切页;keyUp 也消费,
+        // 避免系统把未处理的音量键 keyUp 再交给音量调整流程
+        when (keyCode) {
+            in pageUpKeys, in pageDownKeys -> return true
+        }
         return super.onKeyUp(keyCode, event)
     }
 }

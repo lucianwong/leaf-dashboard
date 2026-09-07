@@ -4,14 +4,25 @@ plugins {
 }
 
 // 构建元信息:每次 git 提交构建,versionCode 自动 +1,版本号永不失更新
-val buildCommit = providers.exec {
-    commandLine("git", "rev-parse", "--short", "HEAD")
-    isIgnoreExitValue = true
-}.standardOutput.asText.get().trim().ifEmpty { "dev" }
-val buildNumber = providers.exec {
-    commandLine("git", "rev-list", "--count", "HEAD")
-    isIgnoreExitValue = true
-}.standardOutput.asText.get().trim().ifEmpty { "0" }.toIntOrNull() ?: 0
+val buildCommit =
+    providers
+        .exec {
+            commandLine("git", "rev-parse", "--short", "HEAD")
+            isIgnoreExitValue = true
+        }.standardOutput.asText
+        .get()
+        .trim()
+        .ifEmpty { "dev" }
+val buildNumber =
+    providers
+        .exec {
+            commandLine("git", "rev-list", "--count", "HEAD")
+            isIgnoreExitValue = true
+        }.standardOutput.asText
+        .get()
+        .trim()
+        .ifEmpty { "0" }
+        .toIntOrNull() ?: 0
 
 android {
     namespace = "com.boolwise.leafdashboard"
@@ -23,7 +34,7 @@ android {
         minSdk = 28
         targetSdk = 34
         versionCode = buildNumber + 100 // 保留人工干预空间,基线 100 起
-        versionName = "0.5.0"
+        versionName = "0.5.1"
 
         // 默认 Dashboard 服务端地址(可被首启动设置里保存的 URL 覆盖)。
         // 换部署环境时改这里,或在 App 首启动界面输入新地址。

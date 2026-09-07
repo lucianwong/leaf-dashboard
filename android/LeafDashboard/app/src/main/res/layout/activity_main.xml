@@ -27,17 +27,21 @@
             android:layout_height="wrap_content"
             android:text="@string/setup_title"
             android:textColor="@android:color/white"
-            android:textSize="28sp"
+            android:textSize="30sp"
+            android:textStyle="bold"
             android:paddingBottom="24dp" />
 
+        <!-- 高对比(E-Ink 可读):纯白底纯黑字,避免默认深色控件在墨水屏上发灰看不清 -->
         <EditText
             android:id="@+id/url_input"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:background="#FFFFFF"
             android:hint="@string/setup_hint"
-            android:textColor="@android:color/white"
-            android:textColorHint="@android:color/darker_gray"
-            android:textSize="20sp"
+            android:textColor="#000000"
+            android:textColorHint="#666666"
+            android:textSize="22sp"
+            android:padding="16dp"
             android:inputType="textUri"
             android:importantForAutofill="no" />
 
@@ -46,14 +50,19 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="24dp"
+            android:background="#FFFFFF"
+            android:textColor="#000000"
             android:text="@string/setup_save"
-            android:textSize="20sp" />
+            android:textSize="20sp"
+            android:textStyle="bold" />
 
         <Button
             android:id="@+id/btn_skip"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
+            android:background="#FFFFFF"
+            android:textColor="#000000"
             android:text="@string/setup_skip"
             android:textSize="20sp" />
     </LinearLayout>

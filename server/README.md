@@ -20,6 +20,10 @@ PORT=8080 npm start
 npm run dev
 ```
 
+**代理依赖(必读)**:`start`/`dev` 脚本已固化 `NODE_USE_ENV_PROXY=1` —— 外网数据源(codex)依赖系统代理(`http_proxy/https_proxy`),Node 原生 fetch 不读代理环境变量,必须带此 env;若绕过 npm 直接 `node src/index.js` 启动,请自行携带 `NODE_USE_ENV_PROXY=1`,否则 codex 源拉取失败。
+
+**数据源密钥**:仓库根/服务端目录的 `.env`(权限 0600,不入库)存放 `ZAI_API_KEY`/`KIMI_API_KEY`,由 index.js 启动时自动加载,无需手动 export。
+
 ## 接口
 
 ### GET /healthz
